@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_node.h"
 
 /* USER CODE END Includes */
 
@@ -46,6 +47,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static APP_NodeContext g_node;
 
 /* USER CODE END PV */
 
@@ -94,6 +96,10 @@ int main(void)
   MX_TIM3_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+  if (APP_Node_Init(&g_node) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END 2 */
 
@@ -104,6 +110,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    APP_Node_Process(&g_node);
   }
   /* USER CODE END 3 */
 }
