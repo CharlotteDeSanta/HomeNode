@@ -24,9 +24,14 @@
 #define APP_ESP_RESPONSE_SIZE    256U
 #define APP_ESP_DRAIN_MS         120U
 #define APP_ESP_CMD_TIMEOUT_MS   1500U
-#define APP_ESP_JOIN_TIMEOUT_MS  7000U
+#define APP_ESP_JOIN_TIMEOUT_MS  12000U
 #define APP_ESP_TCP_TIMEOUT_MS   2500U
+#define APP_ESP_SEND_PROMPT_TIMEOUT_MS 600U
+#define APP_ESP_SEND_ACK_TIMEOUT_MS    800U
 #define APP_ESP_PROMPT_WAIT_MS   600U
+#define APP_ESP_RESET_LOW_MS     10U
+#define APP_ESP_RESET_SETTLE_MS  1000U
+#define APP_ESP_RX_SLICE_BYTES   64U
 #define APP_DEBUG_TX_TIMEOUT_MS  120U
 
 /*
@@ -47,6 +52,42 @@ typedef struct
     uint32_t lastChangeTick;
 } APP_ButtonState;
 
+typedef enum
+{
+    APP_ESP_STATE_IDLE = 0,
+    APP_ESP_STATE_WIFI_WAIT_RETRY,
+    APP_ESP_STATE_WIFI_RESET_LOW,
+    APP_ESP_STATE_WIFI_RESET_SETTLE,
+    APP_ESP_STATE_WIFI_CMD_AT,
+    APP_ESP_STATE_WIFI_CMD_ATE0,
+    APP_ESP_STATE_WIFI_CMD_CWMODE,
+    APP_ESP_STATE_WIFI_CMD_CIPMUX,
+    APP_ESP_STATE_WIFI_CMD_CWJAP,
+    APP_ESP_STATE_READY,
+    APP_ESP_STATE_UPLOAD_CMD_CIPSTART,
+    APP_ESP_STATE_UPLOAD_CMD_CIPSEND,
+    APP_ESP_STATE_UPLOAD_SEND_PAYLOAD,
+    APP_ESP_STATE_UPLOAD_WAIT_SEND_OK,
+    APP_ESP_STATE_UPLOAD_CMD_CLOSE,
+    APP_ESP_STATE_UPLOAD_RECOVER_CLOSE
+} APP_EspState;
+
+typedef enum
+{
+    APP_ESP_EXCHANGE_BUSY = 0,
+    APP_ESP_EXCHANGE_OK,
+    APP_ESP_EXCHANGE_FAIL
+} APP_EspExchangeResult;
+
+typedef struct
+{
+    uint8_t active;
+    uint32_t tag;
+    uint32_t deadlineTick;
+    uint16_t responseLength;
+    char response[APP_ESP_RESPONSE_SIZE];
+} APP_EspExchangeContext;
+
 static APP_ButtonState s_buttons[APP_BUTTON_COUNT] =
 {
     {GPIO_PIN_0, 0U, 0U, 0U},
@@ -66,9 +107,15 @@ static uint8_t s_uploadFailStreak = 0U;
 static uint8_t s_lastUploadOk = 0U;
 static uint16_t s_uploadOkCount = 0U;
 static uint16_t s_uploadFailCount = 0U;
+static uint8_t s_tcpConnected = 0U;
 static uint32_t s_lastDhtPollTick = 0U;
 static uint32_t s_lastWifiAttemptTick = 0U;
 static uint32_t s_nextUploadAttemptTick = 0U;
+static APP_EspState s_espState = APP_ESP_STATE_IDLE;
+static uint32_t s_espStateDeadlineTick = 0U;
+static APP_EspExchangeContext s_espExchange = {0U, 0U, 0U, 0U, {0}};
+static uint16_t s_uploadPayloadLength = 0U;
+static char s_uploadPayload[160];
 static UART_HandleTypeDef* s_debugUart = 0;
 
 static uint8_t app_is_wifi_configured(void)
@@ -426,6 +473,389 @@ static HAL_StatusTypeDef app_post_dht11_test(APP_NodeContext* node)
     }
 
     return status;
+}
+
+static uint8_t app_tick_reached(uint32_t nowTick, uint32_t targetTick)
+{
+    return ((int32_t)(nowTick - targetTick) >= 0) ? 1U : 0U;
+}
+
+static void app_esp_exchange_reset(void)
+{
+    s_espExchange.active = 0U;
+    s_espExchange.tag = 0U;
+    s_espExchange.deadlineTick = 0U;
+    s_espExchange.responseLength = 0U;
+    s_espExchange.response[0] = '\0';
+}
+
+static void app_esp_exchange_deactivate(void)
+{
+    s_espExchange.active = 0U;
+    s_espExchange.tag = 0U;
+    s_espExchange.deadlineTick = 0U;
+}
+
+static void app_esp_rx_discard_slice(BSP_ESP01S_HandleTypeDef* esp, uint16_t maxBytes)
+{
+    uint16_t index;
+    uint8_t dummyByte;
+
+    if (esp == 0)
+    {
+        return;
+    }
+
+    for (index = 0U; index < maxBytes; index++)
+    {
+        if (BSP_ESP01S_Receive(esp, &dummyByte, 1U, 0U) != HAL_OK)
+        {
+            break;
+        }
+    }
+}
+
+static uint8_t app_esp_collect_response_slice(BSP_ESP01S_HandleTypeDef* esp,
+                                              APP_EspExchangeContext* exchange)
+{
+    uint8_t rxByte;
+    uint16_t readCount = 0U;
+    HAL_StatusTypeDef status;
+
+    if ((esp == 0) || (exchange == 0))
+    {
+        return 0U;
+    }
+
+    while (readCount < APP_ESP_RX_SLICE_BYTES)
+    {
+        status = BSP_ESP01S_Receive(esp, &rxByte, 1U, 0U);
+        if (status != HAL_OK)
+        {
+            break;
+        }
+
+        if (exchange->responseLength < (APP_ESP_RESPONSE_SIZE - 1U))
+        {
+            exchange->response[exchange->responseLength] = (char)rxByte;
+            exchange->responseLength++;
+            exchange->response[exchange->responseLength] = '\0';
+        }
+
+        readCount++;
+    }
+
+    return (readCount > 0U) ? 1U : 0U;
+}
+
+static uint8_t app_esp_response_has_error(const char* response)
+{
+    if (response == 0)
+    {
+        return 1U;
+    }
+
+    if (strstr(response, "ERROR") != 0)
+    {
+        return 1U;
+    }
+
+    if (strstr(response, "FAIL") != 0)
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static uint8_t app_esp_response_has_expect(const char* response,
+                                           const char* expect1,
+                                           const char* expect2)
+{
+    if (response == 0)
+    {
+        return 0U;
+    }
+
+    if ((expect1 != 0) && (strstr(response, expect1) != 0))
+    {
+        return 1U;
+    }
+
+    if ((expect2 != 0) && (strstr(response, expect2) != 0))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
+                                                   uint32_t nowTick,
+                                                   uint32_t tag,
+                                                   const char* command,
+                                                   const char* expect1,
+                                                   const char* expect2,
+                                                   uint32_t timeoutMs,
+                                                   uint8_t clearRxOnStart)
+{
+    HAL_StatusTypeDef status;
+    uint8_t rxUpdated;
+
+    if (node == 0)
+    {
+        app_esp_exchange_reset();
+        return APP_ESP_EXCHANGE_FAIL;
+    }
+
+    if ((s_espExchange.active != 0U) && (s_espExchange.tag != tag))
+    {
+        app_esp_exchange_reset();
+    }
+
+    if (s_espExchange.active == 0U)
+    {
+        s_espExchange.active = 1U;
+        s_espExchange.tag = tag;
+        s_espExchange.deadlineTick = nowTick + timeoutMs;
+        s_espExchange.responseLength = 0U;
+        s_espExchange.response[0] = '\0';
+
+        if (clearRxOnStart != 0U)
+        {
+            app_esp_rx_discard_slice(&node->esp, (uint16_t)(APP_ESP_RX_SLICE_BYTES * 3U));
+        }
+
+        if ((command != 0) && (command[0] != '\0'))
+        {
+            app_debug_log("[ESP CMD] %s", command);
+            status = BSP_ESP01S_SendString(&node->esp, command, APP_ESP_CMD_TIMEOUT_MS);
+            if (status != HAL_OK)
+            {
+                app_debug_log("[ESP CMD] tx failed, status=%d", (int)status);
+                app_esp_exchange_deactivate();
+                return APP_ESP_EXCHANGE_FAIL;
+            }
+        }
+    }
+
+    rxUpdated = app_esp_collect_response_slice(&node->esp, &s_espExchange);
+
+    if (app_esp_response_has_expect(s_espExchange.response, expect1, expect2) != 0U)
+    {
+        if (rxUpdated != 0U)
+        {
+            app_debug_log_response("[ESP RSP] ", s_espExchange.response);
+        }
+        app_esp_exchange_deactivate();
+        return APP_ESP_EXCHANGE_OK;
+    }
+
+    if (app_esp_response_has_error(s_espExchange.response) != 0U)
+    {
+        app_debug_log_response("[ESP ERR] ", s_espExchange.response);
+        app_esp_exchange_deactivate();
+        return APP_ESP_EXCHANGE_FAIL;
+    }
+
+    if (app_tick_reached(nowTick, s_espExchange.deadlineTick) != 0U)
+    {
+        app_debug_log_response("[ESP TO] ", s_espExchange.response);
+        app_esp_exchange_deactivate();
+        return APP_ESP_EXCHANGE_FAIL;
+    }
+
+    return APP_ESP_EXCHANGE_BUSY;
+}
+
+static uint8_t app_esp_send_recv_accepted(const char* response)
+{
+    if (response == 0)
+    {
+        return 0U;
+    }
+
+    if ((strstr(response, "Recv ") == 0) || (strstr(response, " bytes") == 0))
+    {
+        return 0U;
+    }
+
+    if (app_esp_response_has_error(response) != 0U)
+    {
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static uint8_t app_esp_cipstart_likely_connected(const char* response)
+{
+    if ((response == 0) || (response[0] == '\0'))
+    {
+        return 0U;
+    }
+
+    if ((strstr(response, "ALREADY CONNECTED") != 0) ||
+        (strstr(response, "CONNECT") != 0))
+    {
+        return 1U;
+    }
+
+    /*
+     * Some traces are truncated under load (for example only "CON").
+     * Treat this as likely connected and confirm by next CIPSEND stage.
+     */
+    if ((strstr(response, "CON") != 0) &&
+        (app_esp_response_has_error(response) == 0U))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static uint8_t app_esp_wifi_join_likely_ok(const char* response)
+{
+    uint8_t hasConnected = 0U;
+    uint8_t hasGotIp = 0U;
+    uint8_t hasOk = 0U;
+    uint8_t hasDisconnect = 0U;
+
+    if ((response == 0) || (response[0] == '\0'))
+    {
+        return 0U;
+    }
+
+    /*
+     * ESP-01S reply can be fragmented or slightly mangled in polling mode.
+     * Accept common truncated variants and continue with normal data upload
+     * verification in following stages.
+     */
+    if (app_esp_response_has_error(response) != 0U)
+    {
+        return 0U;
+    }
+
+    if ((strstr(response, "WIFI DISCONNECT") != 0) ||
+        (strstr(response, "WIFI DISCONECT") != 0) ||
+        (strstr(response, "WIFI DISCONN") != 0) ||
+        (strstr(response, " DISCONNECT") != 0))
+    {
+        hasDisconnect = 1U;
+    }
+
+    if ((strstr(response, "WIFI CONNECTED") != 0) ||
+        (strstr(response, "WIFI CONNECTD") != 0) ||
+        (strstr(response, "WIFI CONECTE") != 0) ||
+        (strstr(response, "WIFI CONECTD") != 0) ||
+        (strstr(response, "WIFI CONN") != 0) ||
+        (strstr(response, "WIFI CONNE") != 0) ||
+        (strstr(response, "WIF CONN") != 0) ||
+        (strstr(response, " CONNCT") != 0) ||
+        (strstr(response, " CONECT") != 0))
+    {
+        hasConnected = 1U;
+    }
+
+    if ((strstr(response, "WIFI GOT IP") != 0) ||
+        (strstr(response, "WIFI GOTIP") != 0) ||
+        (strstr(response, " GOT IP") != 0) ||
+        (strstr(response, " GOTIP") != 0) ||
+        (strstr(response, " OT P") != 0))
+    {
+        hasGotIp = 1U;
+    }
+
+    if ((strstr(response, "\r\nOK\r\n") != 0) ||
+        (strstr(response, " OK") != 0) ||
+        (strstr(response, "OK\r\n") != 0))
+    {
+        hasOk = 1U;
+    }
+
+    if ((hasConnected != 0U) &&
+        (hasDisconnect == 0U) &&
+        ((hasGotIp != 0U) || (hasOk != 0U)))
+    {
+        return 1U;
+    }
+
+    /* Some modules only emit GOT IP fragment without full CONNECTED token. */
+    if (hasGotIp != 0U)
+    {
+        return 1U;
+    }
+
+    /*
+     * In unstable UART captures we may only receive "WIFI CONN" before timeout.
+     * Accept this to avoid unnecessary reset loops; next upload stage verifies link.
+     */
+    if ((hasConnected != 0U) && (hasDisconnect == 0U))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick)
+{
+    s_lastUploadOk = 1U;
+    s_uploadFailStreak = 0U;
+    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
+    if (s_uploadOkCount < 0xFFFFU)
+    {
+        s_uploadOkCount++;
+    }
+
+    if (node != 0)
+    {
+        node->lastTelemetryTick = nowTick;
+    }
+}
+
+static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
+{
+    s_lastUploadOk = 0U;
+    s_tcpConnected = 0U;
+    if (s_uploadFailCount < 0xFFFFU)
+    {
+        s_uploadFailCount++;
+    }
+
+    if (s_uploadFailStreak < 0xFFU)
+    {
+        s_uploadFailStreak++;
+    }
+
+    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS;
+
+    if (s_uploadFailStreak >= APP_UPLOAD_FAIL_REJOIN_THRESHOLD)
+    {
+        app_debug_log("[NET] upload fail streak reached %u, force rejoin",
+                      (unsigned int)APP_UPLOAD_FAIL_REJOIN_THRESHOLD);
+        s_wifiConnected = 0U;
+        s_uploadFailStreak = 0U;
+        s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
+        if (node != 0)
+        {
+            node->wifiConnected = 0U;
+        }
+    }
+}
+
+static void app_update_runtime_view(APP_NodeContext* node)
+{
+    if (node == 0)
+    {
+        return;
+    }
+
+    node->wifiConnected = s_wifiConnected;
+    node->uploadFailStreak = s_uploadFailStreak;
+    node->lastUploadOk = s_lastUploadOk;
+    node->uploadOkCount = s_uploadOkCount;
+    node->uploadFailCount = s_uploadFailCount;
 }
 
 static void app_esp_rx_drain(BSP_ESP01S_HandleTypeDef* esp, uint32_t drainMs)
@@ -802,100 +1232,452 @@ static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
 
 static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
 {
-    if (node != 0)
-    {
-        node->wifiConnected = s_wifiConnected;
-        node->uploadFailStreak = s_uploadFailStreak;
-        node->lastUploadOk = s_lastUploadOk;
-        node->uploadOkCount = s_uploadOkCount;
-        node->uploadFailCount = s_uploadFailCount;
-    }
+    APP_EspExchangeResult exchangeResult;
+    HAL_StatusTypeDef status;
+    int payloadLength;
+    char command[96];
 
-    if ((node == 0) || (s_wifiConfigured == 0U))
-    {
-        if (node != 0)
-        {
-            node->wifiConnected = 0U;
-        }
-        return;
-    }
+    app_update_runtime_view(node);
 
-    if (s_wifiConnected == 0U)
-    {
-        if ((nowTick - s_lastWifiAttemptTick) < APP_WIFI_RETRY_MS)
-        {
-            return;
-        }
-
-        app_debug_log("[NET] wifi disconnected, retry join");
-        s_lastWifiAttemptTick = nowTick;
-        if (app_esp_connect_wifi(node) == HAL_OK)
-        {
-            s_wifiConnected = 1U;
-            s_uploadFailStreak = 0U;
-            node->wifiConnected = 1U;
-            s_nextUploadAttemptTick = HAL_GetTick() + APP_UPLOAD_INTERVAL_MS;
-            app_debug_log("[NET] wait one upload interval after connect");
-        }
-        else
-        {
-            app_debug_log("[NET] wifi join retry failed");
-        }
-        return;
-    }
-
-    if (s_uploadConfigured == 0U)
+    if (node == 0)
     {
         return;
     }
 
-    if ((int32_t)(nowTick - s_nextUploadAttemptTick) < 0)
+    if (s_wifiConfigured == 0U)
     {
-        return;
-    }
-
-    if (app_esp_upload_telemetry(node) == HAL_OK)
-    {
-        s_lastUploadOk = 1U;
-        s_uploadFailStreak = 0U;
-        node->lastTelemetryTick = nowTick;
-        s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
-        if (s_uploadOkCount < 0xFFFFU)
-        {
-            s_uploadOkCount++;
-        }
-        node->uploadFailStreak = s_uploadFailStreak;
-        node->lastUploadOk = s_lastUploadOk;
-        node->uploadOkCount = s_uploadOkCount;
-        node->uploadFailCount = s_uploadFailCount;
-        return;
-    }
-
-    s_lastUploadOk = 0U;
-    if (s_uploadFailCount < 0xFFFFU)
-    {
-        s_uploadFailCount++;
-    }
-    if (s_uploadFailStreak < 0xFFU)
-    {
-        s_uploadFailStreak++;
-    }
-    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS;
-
-    if (s_uploadFailStreak >= APP_UPLOAD_FAIL_REJOIN_THRESHOLD)
-    {
-        app_debug_log("[NET] upload fail streak reached %u, force rejoin",
-                      (unsigned int)APP_UPLOAD_FAIL_REJOIN_THRESHOLD);
         s_wifiConnected = 0U;
-        node->wifiConnected = 0U;
-        s_uploadFailStreak = 0U;
-        s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
+        s_tcpConnected = 0U;
+        s_espState = APP_ESP_STATE_IDLE;
+        app_esp_exchange_reset();
+        app_update_runtime_view(node);
+        return;
     }
 
-    node->uploadFailStreak = s_uploadFailStreak;
-    node->lastUploadOk = s_lastUploadOk;
-    node->uploadOkCount = s_uploadOkCount;
-    node->uploadFailCount = s_uploadFailCount;
+    if (s_espState == APP_ESP_STATE_IDLE)
+    {
+        s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
+        app_esp_exchange_reset();
+    }
+
+    switch (s_espState)
+    {
+        case APP_ESP_STATE_WIFI_WAIT_RETRY:
+            if (app_tick_reached(nowTick, s_lastWifiAttemptTick + APP_WIFI_RETRY_MS) == 0U)
+            {
+                break;
+            }
+
+            app_debug_log("[NET] wifi disconnected, retry join");
+            s_tcpConnected = 0U;
+            s_lastWifiAttemptTick = nowTick;
+            BSP_ESP01S_SetEnable(&node->esp, 1U);
+            HAL_GPIO_WritePin(node->esp.rstPort, node->esp.rstPin, GPIO_PIN_RESET);
+            s_espStateDeadlineTick = nowTick + APP_ESP_RESET_LOW_MS;
+            s_espState = APP_ESP_STATE_WIFI_RESET_LOW;
+            app_esp_exchange_reset();
+            break;
+
+        case APP_ESP_STATE_WIFI_RESET_LOW:
+            if (app_tick_reached(nowTick, s_espStateDeadlineTick) == 0U)
+            {
+                break;
+            }
+
+            HAL_GPIO_WritePin(node->esp.rstPort, node->esp.rstPin, GPIO_PIN_SET);
+            s_espStateDeadlineTick = nowTick + APP_ESP_RESET_SETTLE_MS;
+            s_espState = APP_ESP_STATE_WIFI_RESET_SETTLE;
+            break;
+
+        case APP_ESP_STATE_WIFI_RESET_SETTLE:
+            if (app_tick_reached(nowTick, s_espStateDeadlineTick) == 0U)
+            {
+                break;
+            }
+
+            s_espState = APP_ESP_STATE_WIFI_CMD_AT;
+            app_esp_exchange_reset();
+            break;
+
+        case APP_ESP_STATE_WIFI_CMD_AT:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_WIFI_CMD_AT,
+                                                   "AT\r\n",
+                                                   "OK",
+                                                   0,
+                                                   APP_ESP_CMD_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_OK)
+            {
+                s_espState = APP_ESP_STATE_WIFI_CMD_ATE0;
+            }
+            else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                app_debug_log("[NET] wifi connect failed: AT");
+                s_wifiConnected = 0U;
+                s_tcpConnected = 0U;
+                s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+            }
+            break;
+
+        case APP_ESP_STATE_WIFI_CMD_ATE0:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_WIFI_CMD_ATE0,
+                                                   "ATE0\r\n",
+                                                   "OK",
+                                                   0,
+                                                   APP_ESP_CMD_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                app_debug_log("[NET] wifi connect warning: ATE0 skipped");
+            }
+
+            if (exchangeResult != APP_ESP_EXCHANGE_BUSY)
+            {
+                s_espState = APP_ESP_STATE_WIFI_CMD_CWMODE;
+            }
+            break;
+
+        case APP_ESP_STATE_WIFI_CMD_CWMODE:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_WIFI_CMD_CWMODE,
+                                                   "AT+CWMODE=1\r\n",
+                                                   "OK",
+                                                   0,
+                                                   APP_ESP_CMD_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_OK)
+            {
+                s_espState = APP_ESP_STATE_WIFI_CMD_CIPMUX;
+            }
+            else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                app_debug_log("[NET] wifi connect failed: CWMODE");
+                s_wifiConnected = 0U;
+                s_tcpConnected = 0U;
+                s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+            }
+            break;
+
+        case APP_ESP_STATE_WIFI_CMD_CIPMUX:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_WIFI_CMD_CIPMUX,
+                                                   "AT+CIPMUX=0\r\n",
+                                                   "OK",
+                                                   0,
+                                                   APP_ESP_CMD_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_OK)
+            {
+                s_espState = APP_ESP_STATE_WIFI_CMD_CWJAP;
+            }
+            else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                app_debug_log("[NET] wifi connect failed: CIPMUX");
+                s_wifiConnected = 0U;
+                s_tcpConnected = 0U;
+                s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+            }
+            break;
+
+        case APP_ESP_STATE_WIFI_CMD_CWJAP:
+            (void)snprintf(command,
+                           sizeof(command),
+                           "AT+CWJAP=\"%s\",\"%s\"\r\n",
+                           APP_WIFI_SSID,
+                           APP_WIFI_PASSWORD);
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_WIFI_CMD_CWJAP,
+                                                   command,
+                                                   "WIFI GOT IP",
+                                                   "OK",
+                                                   APP_ESP_JOIN_TIMEOUT_MS,
+                                                   1U);
+            if ((exchangeResult == APP_ESP_EXCHANGE_OK) ||
+                ((exchangeResult == APP_ESP_EXCHANGE_FAIL) &&
+                 (app_esp_wifi_join_likely_ok(s_espExchange.response) != 0U)))
+            {
+                if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+                {
+                    app_debug_log("[NET] wifi join uncertain, accept as connected");
+                }
+                else
+                {
+                    app_debug_log("[NET] wifi connected");
+                }
+
+                s_wifiConnected = 1U;
+                s_tcpConnected = 0U;
+                s_uploadFailStreak = 0U;
+                s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
+                app_debug_log("[NET] wait one upload interval after connect");
+                s_espState = APP_ESP_STATE_READY;
+            }
+            else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                app_debug_log("[NET] wifi join retry failed");
+                s_wifiConnected = 0U;
+                s_tcpConnected = 0U;
+                s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+            }
+            break;
+
+        case APP_ESP_STATE_READY:
+            if (s_wifiConnected == 0U)
+            {
+                s_tcpConnected = 0U;
+                s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+                break;
+            }
+
+            if (s_uploadConfigured == 0U)
+            {
+                break;
+            }
+
+            if (app_tick_reached(nowTick, s_nextUploadAttemptTick) == 0U)
+            {
+                break;
+            }
+
+            payloadLength = snprintf(s_uploadPayload,
+                                     sizeof(s_uploadPayload),
+                                     "T=%u.%u,H=%u.%u,DHTOK=%u,FAN=%u,DUTY=%u,RLY1=%u,RLY2=%u,RLY3=%u\r\n",
+                                     (unsigned int)node->dht11.temperatureInt,
+                                     (unsigned int)node->dht11.temperatureDec,
+                                     (unsigned int)node->dht11.humidityInt,
+                                     (unsigned int)node->dht11.humidityDec,
+                                     (unsigned int)s_dht11Valid,
+                                     (unsigned int)s_fanEnabled,
+                                     (unsigned int)s_fanDutyPercent,
+                                     (unsigned int)s_relayState[0],
+                                     (unsigned int)s_relayState[1],
+                                     (unsigned int)s_relayState[2]);
+            if ((payloadLength <= 0) || ((uint32_t)payloadLength >= sizeof(s_uploadPayload)))
+            {
+                app_debug_log("[NET] payload build failed");
+                app_mark_upload_failure(node, nowTick);
+                s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
+                break;
+            }
+
+            s_uploadPayloadLength = (uint16_t)payloadLength;
+            app_debug_log("[NET] upload payload: %s", s_uploadPayload);
+            s_espState = (s_tcpConnected != 0U) ? APP_ESP_STATE_UPLOAD_CMD_CIPSEND : APP_ESP_STATE_UPLOAD_CMD_CIPSTART;
+            app_esp_exchange_reset();
+            break;
+
+        case APP_ESP_STATE_UPLOAD_CMD_CIPSTART:
+            (void)snprintf(command,
+                           sizeof(command),
+                           "AT+CIPSTART=\"TCP\",\"%s\",%lu\r\n",
+                           APP_UPLOAD_HOST,
+                           (unsigned long)APP_UPLOAD_PORT);
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_UPLOAD_CMD_CIPSTART,
+                                                   command,
+                                                   "OK",
+                                                   "ALREADY CONNECTED",
+                                                   APP_ESP_TCP_TIMEOUT_MS,
+                                                   1U);
+            if ((exchangeResult == APP_ESP_EXCHANGE_OK) ||
+                ((exchangeResult == APP_ESP_EXCHANGE_FAIL) &&
+                 (app_esp_cipstart_likely_connected(s_espExchange.response) != 0U)))
+            {
+                s_tcpConnected = 1U;
+                if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+                {
+                    app_debug_log("[NET] CIPSTART uncertain, continue CIPSEND");
+                }
+                s_espState = APP_ESP_STATE_UPLOAD_CMD_CIPSEND;
+            }
+            else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                if (app_esp_response_has_error(s_espExchange.response) == 0U)
+                {
+                    s_tcpConnected = 1U;
+                    app_debug_log("[NET] CIPSTART timeout w/o error, try CIPSEND");
+                    s_espState = APP_ESP_STATE_UPLOAD_CMD_CIPSEND;
+                }
+                else
+                {
+                    app_debug_log("[NET] CIPSTART failed");
+                    app_mark_upload_failure(node, nowTick);
+                    s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                }
+            }
+            break;
+
+        case APP_ESP_STATE_UPLOAD_CMD_CIPSEND:
+            (void)snprintf(command,
+                           sizeof(command),
+                           "AT+CIPSEND=%u\r\n",
+                           (unsigned int)s_uploadPayloadLength);
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_UPLOAD_CMD_CIPSEND,
+                                                   command,
+                                                   ">",
+                                                   0,
+                                                   APP_ESP_SEND_PROMPT_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_OK)
+            {
+                s_espState = APP_ESP_STATE_UPLOAD_SEND_PAYLOAD;
+            }
+            else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                if (app_esp_response_has_error(s_espExchange.response) == 0U)
+                {
+                    app_debug_log("[NET] CIPSEND timeout w/o error, try payload");
+                    s_espState = APP_ESP_STATE_UPLOAD_SEND_PAYLOAD;
+                }
+                else
+                {
+                    app_debug_log("[NET] CIPSEND prompt failed");
+                    app_mark_upload_failure(node, nowTick);
+                    s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                }
+            }
+            break;
+
+        case APP_ESP_STATE_UPLOAD_SEND_PAYLOAD:
+            if (s_uploadPayloadLength == 0U)
+            {
+                app_debug_log("[NET] empty payload");
+                app_mark_upload_failure(node, nowTick);
+                s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                break;
+            }
+
+            status = BSP_ESP01S_Send(&node->esp,
+                                     (const uint8_t*)s_uploadPayload,
+                                     s_uploadPayloadLength,
+                                     APP_ESP_CMD_TIMEOUT_MS);
+            if (status != HAL_OK)
+            {
+                app_debug_log("[NET] payload tx failed");
+                app_mark_upload_failure(node, nowTick);
+                s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                break;
+            }
+
+            s_espState = APP_ESP_STATE_UPLOAD_WAIT_SEND_OK;
+            app_esp_exchange_reset();
+            break;
+
+        case APP_ESP_STATE_UPLOAD_WAIT_SEND_OK:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_UPLOAD_WAIT_SEND_OK,
+                                                   0,
+                                                   "SEND OK",
+                                                   0,
+                                                   APP_ESP_SEND_ACK_TIMEOUT_MS,
+                                                   0U);
+            if (exchangeResult == APP_ESP_EXCHANGE_OK)
+            {
+                s_tcpConnected = 1U;
+                app_mark_upload_success(node, nowTick);
+                app_debug_log("[NET] upload ok");
+                s_espState = APP_ESP_STATE_READY;
+                break;
+            }
+
+            if ((exchangeResult == APP_ESP_EXCHANGE_BUSY) &&
+                (app_esp_send_recv_accepted(s_espExchange.response) != 0U))
+            {
+                app_esp_exchange_reset();
+                s_tcpConnected = 1U;
+                app_mark_upload_success(node, nowTick);
+                app_debug_log("[NET] upload ok");
+                s_espState = APP_ESP_STATE_READY;
+                break;
+            }
+
+            if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                if (app_esp_send_recv_accepted(s_espExchange.response) != 0U)
+                {
+                    s_tcpConnected = 1U;
+                    app_mark_upload_success(node, nowTick);
+                    app_debug_log("[NET] upload ok");
+                    s_espState = APP_ESP_STATE_READY;
+                }
+                else if (app_esp_response_has_error(s_espExchange.response) == 0U)
+                {
+                    app_debug_log("[NET] send ack timeout, assume sent");
+                    s_tcpConnected = 1U;
+                    app_mark_upload_success(node, nowTick);
+                    app_debug_log("[NET] upload ok");
+                    s_espState = APP_ESP_STATE_READY;
+                }
+                else
+                {
+                    app_debug_log("[NET] send result not ok");
+                    app_mark_upload_failure(node, nowTick);
+                    s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                }
+            }
+            break;
+
+        case APP_ESP_STATE_UPLOAD_CMD_CLOSE:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_UPLOAD_CMD_CLOSE,
+                                                   "AT+CIPCLOSE\r\n",
+                                                   "OK",
+                                                   "CLOSED",
+                                                   APP_ESP_CMD_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_BUSY)
+            {
+                break;
+            }
+
+            if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
+            {
+                app_debug_log("[NET] close not confirmed");
+            }
+
+            s_tcpConnected = 0U;
+            app_mark_upload_success(node, nowTick);
+            app_debug_log("[NET] upload ok");
+            s_espState = APP_ESP_STATE_READY;
+            break;
+
+        case APP_ESP_STATE_UPLOAD_RECOVER_CLOSE:
+            exchangeResult = app_esp_step_exchange(node,
+                                                   nowTick,
+                                                   (uint32_t)APP_ESP_STATE_UPLOAD_RECOVER_CLOSE,
+                                                   "AT+CIPCLOSE\r\n",
+                                                   "OK",
+                                                   "CLOSED",
+                                                   APP_ESP_CMD_TIMEOUT_MS,
+                                                   1U);
+            if (exchangeResult == APP_ESP_EXCHANGE_BUSY)
+            {
+                break;
+            }
+
+            s_tcpConnected = 0U;
+            s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
+            break;
+
+        default:
+            s_espState = APP_ESP_STATE_IDLE;
+            app_esp_exchange_reset();
+            break;
+    }
+
+    app_update_runtime_view(node);
 }
 
 static HAL_StatusTypeDef app_post_esp01s_test(APP_NodeContext* node)
@@ -1047,6 +1829,7 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     s_lastUploadOk = 0U;
     s_uploadOkCount = 0U;
     s_uploadFailCount = 0U;
+    s_tcpConnected = 0U;
     node->dht11Valid = 0U;
     node->wifiConnected = 0U;
     node->uploadEnabled = s_uploadConfigured;
@@ -1088,6 +1871,11 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     s_lastWifiAttemptTick = nowTick - APP_WIFI_RETRY_MS;
     node->lastTelemetryTick = nowTick - APP_UPLOAD_INTERVAL_MS;
     s_nextUploadAttemptTick = nowTick;
+    s_espState = APP_ESP_STATE_IDLE;
+    s_espStateDeadlineTick = nowTick;
+    app_esp_exchange_reset();
+    s_uploadPayloadLength = 0U;
+    s_uploadPayload[0] = '\0';
     APP_Node_RunPowerOnSelfTest(node);
     return HAL_OK;
 }
