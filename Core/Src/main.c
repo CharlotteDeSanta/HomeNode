@@ -37,6 +37,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define APP_USE_DEBUG_UART1 1U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,6 +50,10 @@
 
 /* USER CODE BEGIN PV */
 static APP_NodeContext g_node;
+static volatile uint32_t g_postPassMask = 0U;
+static volatile uint32_t g_postFailMask = 0U;
+static volatile uint8_t g_postAllPassed = 0U;
+static volatile uint8_t g_postDone = 0U;
 
 /* USER CODE END PV */
 
@@ -59,6 +65,26 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void APP_RefreshPostMirror(void)
+{
+  const APP_PostResult* post = APP_Node_GetPostResult(&g_node);
+
+  if (post != 0)
+  {
+    g_postPassMask = post->passMask;
+    g_postFailMask = post->failMask;
+    g_postDone = post->done;
+  }
+  else
+  {
+    g_postPassMask = 0U;
+    g_postFailMask = 0U;
+    g_postDone = 0U;
+  }
+
+  g_postAllPassed = APP_Node_IsPostPassed(&g_node);
+}
 
 /* USER CODE END 0 */
 
@@ -95,10 +121,20 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_USART3_UART_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+#if APP_USE_DEBUG_UART1
+  extern UART_HandleTypeDef huart1;
+  APP_Node_SetDebugUart(&huart1);
+#endif
+
   if (APP_Node_Init(&g_node) != HAL_OK)
   {
     Error_Handler();
+  }
+  else
+  {
+    APP_RefreshPostMirror();
   }
 
   /* USER CODE END 2 */
@@ -110,6 +146,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    APP_RefreshPostMirror();
     APP_Node_Process(&g_node);
   }
   /* USER CODE END 3 */
