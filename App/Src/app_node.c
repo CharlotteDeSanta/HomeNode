@@ -22,13 +22,11 @@
 #define APP_UPLOAD_RETRY_MS      1000U
 #define APP_UPLOAD_FAIL_REJOIN_THRESHOLD 6U
 #define APP_ESP_RESPONSE_SIZE    256U
-#define APP_ESP_DRAIN_MS         120U
 #define APP_ESP_CMD_TIMEOUT_MS   1500U
 #define APP_ESP_JOIN_TIMEOUT_MS  12000U
 #define APP_ESP_TCP_TIMEOUT_MS   2500U
 #define APP_ESP_SEND_PROMPT_TIMEOUT_MS 600U
 #define APP_ESP_SEND_ACK_TIMEOUT_MS    800U
-#define APP_ESP_PROMPT_WAIT_MS   600U
 #define APP_ESP_RESET_LOW_MS     10U
 #define APP_ESP_RESET_SETTLE_MS  1000U
 #define APP_ESP_RX_SLICE_BYTES   64U
@@ -54,6 +52,7 @@ typedef struct
 
 typedef enum
 {
+    /* Wi-Fi + TCP upload state machine (driven by app_service_esp). */
     APP_ESP_STATE_IDLE = 0,
     APP_ESP_STATE_WIFI_WAIT_RETRY,
     APP_ESP_STATE_WIFI_RESET_LOW,
@@ -81,6 +80,7 @@ typedef enum
 
 typedef struct
 {
+    /* One in-flight AT exchange context; reused across state-machine ticks. */
     uint8_t active;
     uint32_t tag;
     uint32_t deadlineTick;
@@ -259,90 +259,6 @@ static void app_apply_fan_state(void)
     }
 
     (void)BSP_Motor_Set(BSP_MOTOR_CHANNEL_A, BSP_MOTOR_FORWARD, pulse);
-}
-
-static uint8_t app_esp_has_terminal(const char* response)
-{
-    if (response == 0)
-    {
-        return 0U;
-    }
-
-    if ((strstr(response, "\r\nOK\r\n") != 0) || (strstr(response, "OK\r\n") != 0))
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "ERROR") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "FAIL") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "WIFI GOT IP") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "SEND OK") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "ALREADY CONNECTED") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, ">") != 0)
-    {
-        return 1U;
-    }
-
-    return 0U;
-}
-
-static HAL_StatusTypeDef app_esp_read_response(BSP_ESP01S_HandleTypeDef* esp,
-                                               char* response,
-                                               uint16_t responseSize,
-                                               uint32_t timeoutMs)
-{
-    uint8_t rxByte;
-    uint16_t length = 0U;
-    uint32_t startTick;
-    HAL_StatusTypeDef status;
-
-    if ((esp == 0) || (response == 0) || (responseSize < 2U))
-    {
-        return HAL_ERROR;
-    }
-
-    response[0] = '\0';
-    startTick = HAL_GetTick();
-
-    while (((HAL_GetTick() - startTick) < timeoutMs) && (length < (responseSize - 1U)))
-    {
-        status = BSP_ESP01S_Receive(esp, &rxByte, 1U, 20U);
-        if (status != HAL_OK)
-        {
-            continue;
-        }
-
-        response[length] = (char)rxByte;
-        length++;
-        response[length] = '\0';
-
-        if (app_esp_has_terminal(response) != 0U)
-        {
-            return HAL_OK;
-        }
-    }
-
-    return (length > 0U) ? HAL_OK : HAL_TIMEOUT;
 }
 
 static void app_post_mark(APP_NodeContext* node, APP_PostItem item, HAL_StatusTypeDef status)
@@ -615,6 +531,7 @@ static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
 
     if (s_espExchange.active == 0U)
     {
+        /* First entry for this step: initialize response buffer and send command once. */
         s_espExchange.active = 1U;
         s_espExchange.tag = tag;
         s_espExchange.deadlineTick = nowTick + timeoutMs;
@@ -639,6 +556,7 @@ static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
         }
     }
 
+    /* Subsequent entries: collect a small RX slice and evaluate completion. */
     rxUpdated = app_esp_collect_response_slice(&node->esp, &s_espExchange);
 
     if (app_esp_response_has_expect(s_espExchange.response, expect1, expect2) != 0U)
@@ -874,337 +792,6 @@ static void app_esp_rx_drain(BSP_ESP01S_HandleTypeDef* esp, uint32_t drainMs)
     }
 }
 
-static HAL_StatusTypeDef app_esp_send_command(APP_NodeContext* node,
-                                              const char* command,
-                                              const char* expect1,
-                                              const char* expect2,
-                                              uint32_t timeoutMs,
-                                              char* response,
-                                              uint16_t responseSize)
-{
-    char extra[96];
-    uint16_t responseLength;
-    uint16_t extraLength;
-    uint16_t copyLength;
-    uint32_t waitStart;
-    HAL_StatusTypeDef extraStatus;
-    HAL_StatusTypeDef status;
-
-    if ((node == 0) || (command == 0) || (response == 0) || (responseSize < 2U))
-    {
-        return HAL_ERROR;
-    }
-
-    app_debug_log("[ESP CMD] %s", command);
-    app_esp_rx_drain(&node->esp, APP_ESP_DRAIN_MS);
-    status = BSP_ESP01S_SendString(&node->esp, command, APP_ESP_CMD_TIMEOUT_MS);
-    if (status != HAL_OK)
-    {
-        app_debug_log("[ESP CMD] tx failed, status=%d", (int)status);
-        return status;
-    }
-
-    status = app_esp_read_response(&node->esp, response, responseSize, timeoutMs);
-    if (status != HAL_OK)
-    {
-        app_debug_log("[ESP CMD] rx timeout, status=%d", (int)status);
-        return status;
-    }
-
-    app_debug_log_response("[ESP RSP] ", response);
-
-    if ((expect1 != 0) && (strstr(response, expect1) != 0))
-    {
-        return HAL_OK;
-    }
-
-    if ((expect2 != 0) && (strstr(response, expect2) != 0))
-    {
-        return HAL_OK;
-    }
-
-    if ((strstr(response, "ERROR") != 0) || (strstr(response, "FAIL") != 0))
-    {
-        app_debug_log("[ESP CMD] command failed");
-        return HAL_ERROR;
-    }
-
-    if ((expect1 != 0) && (strcmp(expect1, ">") == 0))
-    {
-        waitStart = HAL_GetTick();
-        responseLength = (uint16_t)strlen(response);
-
-        while ((HAL_GetTick() - waitStart) < APP_ESP_PROMPT_WAIT_MS)
-        {
-            extraStatus = app_esp_read_response(&node->esp,
-                                                extra,
-                                                (uint16_t)sizeof(extra),
-                                                120U);
-            if (extraStatus != HAL_OK)
-            {
-                continue;
-            }
-
-            app_debug_log_response("[ESP RSP+] ", extra);
-            extraLength = (uint16_t)strlen(extra);
-
-            if ((responseLength < (responseSize - 1U)) && (extraLength > 0U))
-            {
-                copyLength = extraLength;
-                if ((responseLength + copyLength) >= responseSize)
-                {
-                    copyLength = (uint16_t)((responseSize - 1U) - responseLength);
-                }
-
-                if (copyLength > 0U)
-                {
-                    memcpy(&response[responseLength], extra, copyLength);
-                    responseLength = (uint16_t)(responseLength + copyLength);
-                    response[responseLength] = '\0';
-                }
-            }
-
-            if (strstr(response, ">") != 0)
-            {
-                return HAL_OK;
-            }
-
-            if ((strstr(extra, "ERROR") != 0) || (strstr(extra, "FAIL") != 0))
-            {
-                app_debug_log("[ESP CMD] prompt wait failed");
-                return HAL_ERROR;
-            }
-        }
-    }
-
-    app_debug_log("[ESP CMD] unexpected response");
-    return HAL_ERROR;
-}
-
-static HAL_StatusTypeDef app_esp_connect_wifi(APP_NodeContext* node)
-{
-    char response[APP_ESP_RESPONSE_SIZE];
-    char command[160];
-    HAL_StatusTypeDef status;
-
-    if ((node == 0) || (s_wifiConfigured == 0U))
-    {
-        return HAL_ERROR;
-    }
-
-    app_debug_log("[NET] wifi connect begin");
-    BSP_ESP01S_SetEnable(&node->esp, 1U);
-    BSP_ESP01S_Reset(&node->esp);
-
-    status = app_esp_send_command(node,
-                                  "AT\r\n",
-                                  "OK",
-                                  0,
-                                  APP_ESP_CMD_TIMEOUT_MS,
-                                  response,
-                                  (uint16_t)sizeof(response));
-    if (status != HAL_OK)
-    {
-        app_debug_log("[NET] wifi connect failed: AT");
-        return status;
-    }
-
-    (void)app_esp_send_command(node,
-                               "ATE0\r\n",
-                               "OK",
-                               0,
-                               APP_ESP_CMD_TIMEOUT_MS,
-                               response,
-                               (uint16_t)sizeof(response));
-
-    status = app_esp_send_command(node,
-                                  "AT+CWMODE=1\r\n",
-                                  "OK",
-                                  0,
-                                  APP_ESP_CMD_TIMEOUT_MS,
-                                  response,
-                                  (uint16_t)sizeof(response));
-    if (status != HAL_OK)
-    {
-        app_debug_log("[NET] wifi connect failed: CWMODE");
-        return status;
-    }
-
-    status = app_esp_send_command(node,
-                                  "AT+CIPMUX=0\r\n",
-                                  "OK",
-                                  0,
-                                  APP_ESP_CMD_TIMEOUT_MS,
-                                  response,
-                                  (uint16_t)sizeof(response));
-    if (status != HAL_OK)
-    {
-        app_debug_log("[NET] wifi connect failed: CIPMUX");
-        return status;
-    }
-
-    (void)snprintf(command,
-                   sizeof(command),
-                   "AT+CWJAP=\"%s\",\"%s\"\r\n",
-                   APP_WIFI_SSID,
-                   APP_WIFI_PASSWORD);
-    status = app_esp_send_command(node,
-                                  command,
-                                  "WIFI GOT IP",
-                                  "OK",
-                                  APP_ESP_JOIN_TIMEOUT_MS,
-                                  response,
-                                  (uint16_t)sizeof(response));
-    if (status != HAL_OK)
-    {
-        if (strstr(response, "WIFI CONNECTED") != 0)
-        {
-            app_debug_log("[NET] wifi connected (late got ip)");
-            return HAL_OK;
-        }
-
-        app_debug_log("[NET] wifi connect failed: CWJAP");
-        return HAL_ERROR;
-    }
-
-    app_debug_log("[NET] wifi connected");
-    return HAL_OK;
-}
-
-static HAL_StatusTypeDef app_esp_upload_telemetry(APP_NodeContext* node)
-{
-    char response[APP_ESP_RESPONSE_SIZE];
-    char command[96];
-    char tcpPayload[160];
-    uint8_t sendOk = 0U;
-    int payloadLength;
-    HAL_StatusTypeDef status;
-
-    if ((node == 0) || (s_uploadConfigured == 0U))
-    {
-        return HAL_ERROR;
-    }
-
-    payloadLength = snprintf(tcpPayload,
-                             sizeof(tcpPayload),
-                             "T=%u.%u,H=%u.%u,DHTOK=%u,FAN=%u,DUTY=%u,RLY1=%u,RLY2=%u,RLY3=%u\r\n",
-                             (unsigned int)node->dht11.temperatureInt,
-                             (unsigned int)node->dht11.temperatureDec,
-                             (unsigned int)node->dht11.humidityInt,
-                             (unsigned int)node->dht11.humidityDec,
-                             (unsigned int)s_dht11Valid,
-                             (unsigned int)s_fanEnabled,
-                             (unsigned int)s_fanDutyPercent,
-                             (unsigned int)s_relayState[0],
-                             (unsigned int)s_relayState[1],
-                             (unsigned int)s_relayState[2]);
-    if ((payloadLength <= 0) || ((uint32_t)payloadLength >= sizeof(tcpPayload)))
-    {
-        app_debug_log("[NET] payload build failed");
-        return HAL_ERROR;
-    }
-
-    app_debug_log("[NET] upload payload: %s", tcpPayload);
-
-    (void)snprintf(command,
-                   sizeof(command),
-                   "AT+CIPSTART=\"TCP\",\"%s\",%lu\r\n",
-                   APP_UPLOAD_HOST,
-                   (unsigned long)APP_UPLOAD_PORT);
-    status = app_esp_send_command(node,
-                                  command,
-                                  "OK",
-                                  "ALREADY CONNECTED",
-                                  APP_ESP_TCP_TIMEOUT_MS,
-                                  response,
-                                  (uint16_t)sizeof(response));
-    if ((status != HAL_OK) && (strstr(response, "CONNECT") == 0))
-    {
-        app_debug_log("[NET] CIPSTART failed");
-        return HAL_ERROR;
-    }
-
-    (void)snprintf(command, sizeof(command), "AT+CIPSEND=%lu\r\n", (unsigned long)payloadLength);
-    status = app_esp_send_command(node,
-                                  command,
-                                  ">",
-                                  0,
-                                  APP_ESP_CMD_TIMEOUT_MS,
-                                  response,
-                                  (uint16_t)sizeof(response));
-    if (status != HAL_OK)
-    {
-        app_debug_log("[NET] CIPSEND prompt failed");
-        (void)app_esp_send_command(node,
-                                   "AT+CIPCLOSE\r\n",
-                                   "OK",
-                                   "CLOSED",
-                                   APP_ESP_CMD_TIMEOUT_MS,
-                                   response,
-                                   (uint16_t)sizeof(response));
-        return status;
-    }
-
-    status = BSP_ESP01S_Send(&node->esp, (const uint8_t*)tcpPayload, (uint16_t)payloadLength, 3000U);
-    if (status != HAL_OK)
-    {
-        app_debug_log("[NET] payload tx failed");
-        (void)app_esp_send_command(node,
-                                   "AT+CIPCLOSE\r\n",
-                                   "OK",
-                                   "CLOSED",
-                                   APP_ESP_CMD_TIMEOUT_MS,
-                                   response,
-                                   (uint16_t)sizeof(response));
-        return status;
-    }
-
-    status = app_esp_read_response(&node->esp,
-                                   response,
-                                   (uint16_t)sizeof(response),
-                                   APP_ESP_TCP_TIMEOUT_MS);
-    if (status == HAL_OK)
-    {
-        app_debug_log_response("[NET] send rsp: ", response);
-        if (strstr(response, "SEND OK") != 0)
-        {
-            sendOk = 1U;
-        }
-        else if ((strstr(response, "Recv ") != 0) &&
-                 (strstr(response, " bytes") != 0) &&
-                 (strstr(response, "ERROR") == 0) &&
-                 (strstr(response, "FAIL") == 0))
-        {
-            sendOk = 1U;
-        }
-    }
-
-    if (sendOk == 0U)
-    {
-        app_debug_log("[NET] send result not ok");
-        (void)app_esp_send_command(node,
-                                   "AT+CIPCLOSE\r\n",
-                                   "OK",
-                                   "CLOSED",
-                                   APP_ESP_CMD_TIMEOUT_MS,
-                                   response,
-                                   (uint16_t)sizeof(response));
-        return HAL_ERROR;
-    }
-
-    /* Keep short-connection behavior deterministic for different server types. */
-    (void)app_esp_send_command(node,
-                               "AT+CIPCLOSE\r\n",
-                               "OK",
-                               "CLOSED",
-                               APP_ESP_CMD_TIMEOUT_MS,
-                               response,
-                               (uint16_t)sizeof(response));
-
-    app_debug_log("[NET] upload ok");
-    return HAL_OK;
-}
-
 static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
 {
     if (node == 0)
@@ -1263,6 +850,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
     switch (s_espState)
     {
         case APP_ESP_STATE_WIFI_WAIT_RETRY:
+            /* Global reconnect gate to avoid aggressive reset/AT storms. */
             if (app_tick_reached(nowTick, s_lastWifiAttemptTick + APP_WIFI_RETRY_MS) == 0U)
             {
                 break;
@@ -1386,6 +974,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_WIFI_CMD_CWJAP:
+            /* Join AP can return truncated text; handled by tolerant parser below. */
             (void)snprintf(command,
                            sizeof(command),
                            "AT+CWJAP=\"%s\",\"%s\"\r\n",
@@ -1469,11 +1058,13 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
 
             s_uploadPayloadLength = (uint16_t)payloadLength;
             app_debug_log("[NET] upload payload: %s", s_uploadPayload);
+            /* Prefer long connection: skip CIPSTART when TCP link is considered alive. */
             s_espState = (s_tcpConnected != 0U) ? APP_ESP_STATE_UPLOAD_CMD_CIPSEND : APP_ESP_STATE_UPLOAD_CMD_CIPSTART;
             app_esp_exchange_reset();
             break;
 
         case APP_ESP_STATE_UPLOAD_CMD_CIPSTART:
+            /* Open TCP only when needed; ambiguous timeout is handled conservatively. */
             (void)snprintf(command,
                            sizeof(command),
                            "AT+CIPSTART=\"TCP\",\"%s\",%lu\r\n",
@@ -1516,6 +1107,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_UPLOAD_CMD_CIPSEND:
+            /* Ask for send prompt. If prompt text is missing but no explicit error, continue. */
             (void)snprintf(command,
                            sizeof(command),
                            "AT+CIPSEND=%u\r\n",
@@ -1574,6 +1166,10 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_UPLOAD_WAIT_SEND_OK:
+            /*
+             * Some firmwares may not return full "SEND OK" in polling mode.
+             * If no explicit ERROR/FAIL appears, treat as soft-success to keep cadence.
+             */
             exchangeResult = app_esp_step_exchange(node,
                                                    nowTick,
                                                    (uint32_t)APP_ESP_STATE_UPLOAD_WAIT_SEND_OK,
@@ -1654,6 +1250,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_UPLOAD_RECOVER_CLOSE:
+            /* Recovery path: try close once, then fall back to READY / reconnect flow. */
             exchangeResult = app_esp_step_exchange(node,
                                                    nowTick,
                                                    (uint32_t)APP_ESP_STATE_UPLOAD_RECOVER_CLOSE,

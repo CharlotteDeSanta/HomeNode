@@ -146,6 +146,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Single app tick: local IO, sensor poll and ESP state machine are all inside. */
     APP_RefreshPostMirror();
     APP_Node_Process(&g_node);
   }
