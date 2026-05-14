@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.22)
 
 #
 # This file is generated only once,
@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/App/Src/bsp_motor.c
     ${CMAKE_CURRENT_SOURCE_DIR}/App/Src/bsp_relay.c
     ${CMAKE_CURRENT_SOURCE_DIR}/App/Src/app_node.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/App/Src/app_home_protocol.c
 )
 
 # Add include paths

@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_node.h"
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -50,10 +51,8 @@
 
 /* USER CODE BEGIN PV */
 static APP_NodeContext g_node;
-static volatile uint32_t g_postPassMask = 0U;
-static volatile uint32_t g_postFailMask = 0U;
-static volatile uint8_t g_postAllPassed = 0U;
-static volatile uint8_t g_postDone = 0U;
+volatile uint32_t g_bootStage = 0U;
+volatile uint32_t g_errorStage = 0U;
 
 /* USER CODE END PV */
 
@@ -65,26 +64,6 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-static void APP_RefreshPostMirror(void)
-{
-  const APP_PostResult* post = APP_Node_GetPostResult(&g_node);
-
-  if (post != 0)
-  {
-    g_postPassMask = post->passMask;
-    g_postFailMask = post->failMask;
-    g_postDone = post->done;
-  }
-  else
-  {
-    g_postPassMask = 0U;
-    g_postFailMask = 0U;
-    g_postDone = 0U;
-  }
-
-  g_postAllPassed = APP_Node_IsPostPassed(&g_node);
-}
 
 /* USER CODE END 0 */
 
@@ -102,6 +81,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  g_bootStage = 10U;
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -109,6 +89,7 @@ int main(void)
   /* USER CODE END Init */
 
   /* Configure the system clock */
+  g_bootStage = 20U;
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
@@ -116,25 +97,33 @@ int main(void)
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
+  g_bootStage = 30U;
   MX_GPIO_Init();
+  g_bootStage = 40U;
   MX_RTC_Init();
+  g_bootStage = 50U;
   MX_TIM2_Init();
+  g_bootStage = 60U;
   MX_TIM3_Init();
+  g_bootStage = 70U;
   MX_USART3_UART_Init();
+  g_bootStage = 80U;
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 #if APP_USE_DEBUG_UART1
   extern UART_HandleTypeDef huart1;
+  const char bootMessage[] = "[BOOT] USART1 debug ready\r\n";
   APP_Node_SetDebugUart(&huart1);
+  (void)HAL_UART_Transmit(&huart1,
+                          (uint8_t*)bootMessage,
+                          (uint16_t)strlen(bootMessage),
+                          1000U);
 #endif
 
+  g_bootStage = 90U;
   if (APP_Node_Init(&g_node) != HAL_OK)
   {
     Error_Handler();
-  }
-  else
-  {
-    APP_RefreshPostMirror();
   }
 
   /* USER CODE END 2 */
@@ -147,7 +136,6 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     /* Single app tick: local IO, sensor poll and ESP state machine are all inside. */
-    APP_RefreshPostMirror();
     APP_Node_Process(&g_node);
   }
   /* USER CODE END 3 */
@@ -166,14 +154,15 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE|RCC_OSCILLATORTYPE_LSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  g_bootStage = 21U;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -188,12 +177,14 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
+  g_bootStage = 22U;
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC;
-  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSE;
+  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
+  g_bootStage = 23U;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
@@ -212,6 +203,7 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  g_errorStage = g_bootStage;
   __disable_irq();
   while (1)
   {

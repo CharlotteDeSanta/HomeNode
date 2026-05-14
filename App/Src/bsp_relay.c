@@ -6,6 +6,8 @@
 #define RELAY2_PIN  GPIO_PIN_4
 #define RELAY3_PORT GPIOB
 #define RELAY3_PIN  GPIO_PIN_5
+#define RELAY_ACTIVE_STATE   GPIO_PIN_SET
+#define RELAY_INACTIVE_STATE GPIO_PIN_RESET
 
 void BSP_Relay_Init(void)
 {
@@ -35,13 +37,13 @@ HAL_StatusTypeDef BSP_Relay_Set(BSP_RelayChannel channel, uint8_t enable)
         return HAL_ERROR;
     }
 
-    HAL_GPIO_WritePin(port, pin, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(port, pin, enable ? RELAY_ACTIVE_STATE : RELAY_INACTIVE_STATE);
     return HAL_OK;
 }
 
 void BSP_Relay_SetAll(uint8_t enable)
 {
-    HAL_GPIO_WritePin(RELAY1_PORT, RELAY1_PIN, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(RELAY2_PORT, RELAY2_PIN, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(RELAY3_PORT, RELAY3_PIN, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RELAY1_PORT, RELAY1_PIN, enable ? RELAY_ACTIVE_STATE : RELAY_INACTIVE_STATE);
+    HAL_GPIO_WritePin(RELAY2_PORT, RELAY2_PIN, enable ? RELAY_ACTIVE_STATE : RELAY_INACTIVE_STATE);
+    HAL_GPIO_WritePin(RELAY3_PORT, RELAY3_PIN, enable ? RELAY_ACTIVE_STATE : RELAY_INACTIVE_STATE);
 }
