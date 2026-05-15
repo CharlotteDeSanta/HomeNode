@@ -30,6 +30,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
+# Node role selection (compile-time).
+# Values: kitchen / living / bedroom
+set(HOME_NODE_ROLE "kitchen" CACHE STRING "Node role for HomeNode (kitchen|living|bedroom)")
+set_property(CACHE HOME_NODE_ROLE PROPERTY STRINGS kitchen living bedroom)
+string(TOLOWER "${HOME_NODE_ROLE}" HOME_NODE_ROLE_LOWER)
+
+if(HOME_NODE_ROLE_LOWER STREQUAL "kitchen")
+    set(HOME_NODE_ID_VALUE 1)
+elseif(HOME_NODE_ROLE_LOWER STREQUAL "living")
+    set(HOME_NODE_ID_VALUE 2)
+elseif(HOME_NODE_ROLE_LOWER STREQUAL "bedroom")
+    set(HOME_NODE_ID_VALUE 3)
+else()
+    message(FATAL_ERROR "Invalid HOME_NODE_ROLE='${HOME_NODE_ROLE}'. Use kitchen|living|bedroom.")
+endif()
+
+message(STATUS "HomeNode role: ${HOME_NODE_ROLE_LOWER} (node=${HOME_NODE_ID_VALUE})")
+
 # Enable CMake support for ASM, C and C++ languages
 enable_language(C CXX ASM)
 
@@ -62,7 +80,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined symbols
+    APP_NODE_ID=${HOME_NODE_ID_VALUE}
 )
 
 # Remove wrong libob.a library dependency when using cpp files
@@ -74,5 +92,4 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
-
 

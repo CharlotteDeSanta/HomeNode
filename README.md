@@ -1,194 +1,168 @@
-﻿# HomeNode
+# HomeNode
 
-## 项目定位
+`HomeNode` 是智能家居系统的下位机节点工程（STM32F103C8T6），通过 `ESP-01S` 接入同一局域网，并与上位机 `HomePanel_test` 使用自定义轻量协议进行双向通信。
 
-`HomeNode` 是毕业设计中的下位机节点工程，目标 MCU 为 `STM32F103C8T6`。
-该节点负责本地执行与采集，后续通过 `ESP-01S` 与上位机或局域网控制端联动。
+当前版本重点是“稳定联通 + 协议闭环”，不是追求全功能堆叠。
 
-当前工程由 `STM32CubeMX + CMake` 生成，目录位于：
+---
 
-`C:\Users\20953\Documents\MCUProjects\HomeNode`
+## 1. 当前进度（与代码一致）
 
-## 当前设计目标
+当前已实现并持续联调的能力：
 
-第一版下位机计划完成以下功能：
+- 三路继电器独立控制（USB1/USB2/USB3）。
+- 传感数据与状态上报（温度、湿度、模式、风速、输出位）。
+- 接收上位机 `CONTROL` 指令并立即执行（继电器 + 风扇状态）。
+- 协议 `ACK/ERR` 回应链路。
+- ESP 串口 DMA 循环接收，降低了丢字节和串口堵塞问题。
+- WiFi/TCP 状态机重连与节奏控制（含失败退避、重开连接）。
 
-1. 通过 `DHT11` 采集环境温湿度。
-2. 通过 `TB6612FNG` 驱动风扇或电机，实现转向与调速。
-3. 通过 `ESP-01S` 实现串口通信，为后续联网和上下位机通信做准备。
-4. 独立控制 3 路 USB 充电继电器。
-5. 为后续与上位机统一协议接入预留软件结构。
+---
 
-## 当前硬件结论
+## 2. 目录说明
 
-根据原理图与 SVG 原理图检查，当前推荐并已在 CubeMX 中体现的引脚如下。
+- `App/Src/app_node.c`
+  - 节点主状态机、AT 流程、协议收发、控制执行逻辑。
+- `App/Src/app_home_protocol.c`
+  - 协议编解码与 CRC。
+- `App/Src/bsp_esp01s.c`
+  - ESP 串口发送/接收封装（含 DMA RX 环形读）。
+- `App/Src/bsp_relay.c` / `bsp_motor.c` / `bsp_dht11.c`
+  - 外设驱动。
+- `CMakeLists.txt`
+  - 工程构建入口，包含“编译期节点角色选择”。
 
-### ESP-01S
+---
 
-- `PB10 -> USART3_TX -> ESP_RXD`
-- `PB11 -> USART3_RX -> ESP_TXD`
-- `PB8 -> GPIO_Output -> ESP_RST`
-- `PB9 -> GPIO_Output -> ESP_EN`
+## 3. 编译时选择节点（厨房 / 起居室 / 卧室）
 
-### DHT11
+本工程已支持 **编译期节点选择**，不需要再手动改源码中的 `APP_NODE_ID`。
 
-- `PA6 -> DATA`
-- 软件中需要把该引脚在输出和输入模式之间切换
+### 3.1 可选角色
 
-### TB6612FNG
+- `kitchen` -> 节点 ID = `1`
+- `living` -> 节点 ID = `2`
+- `bedroom` -> 节点 ID = `3`
 
-- `PB0 -> TIM3_CH3 -> PWMA`
-- `PB1 -> TIM3_CH4 -> PWMB`
-- `PA5 -> GPIO_Output -> AIN2`
-- `PA4 -> GPIO_Output -> AIN1`
-- `PA7 -> GPIO_Output -> STBY`
-- `PB13 -> GPIO_Output -> BIN1`
-- `PB14 -> GPIO_Output -> BIN2`
+### 3.2 方式 A：直接使用预设（推荐）
 
-### USB 继电器控制
+工程已提供以下 preset：
 
-当前原理图已调整为 3 路独立控制：
+- `DebugKitchen`
+- `DebugLiving`
+- `DebugBedroom`
 
-- `PB3 -> K1_CTRL`
-- `PB4 -> K2_CTRL`
-- `PB5 -> K3_CTRL`
+命令示例（PowerShell）：
 
-注意：每一路继电器都应通过独立三极管或 MOSFET 驱动，并保留续流二极管，不能由 MCU 直接带线圈。
+```powershell
+cmake --preset DebugKitchen
+cmake --build --preset DebugKitchen
+```
 
-## 当前 CubeMX 基线
+```powershell
+cmake --preset DebugLiving
+cmake --build --preset DebugLiving
+```
 
-### 已启用外设
+```powershell
+cmake --preset DebugBedroom
+cmake --build --preset DebugBedroom
+```
 
-- `RTC`
-- `TIM2`
-- `TIM3`
-- `USART3`
-- `GPIO`
-- `SYS (SWD)`
-- `RCC`
+### 3.3 方式 B：自定义变量
 
-### 时钟配置
+也可以直接指定缓存变量：
 
-- `HSE` 外部高速晶振开启
-- `PLL` 输出系统时钟 `72 MHz`
-- `LSE` 开启，供 `RTC` 使用
+```powershell
+cmake -S . -B build/Debug -G Ninja -DHOME_NODE_ROLE=kitchen -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/Debug
+```
 
-### TIM2 用途
+`HOME_NODE_ROLE` 仅支持：`kitchen|living|bedroom`，其他值会在配置阶段直接报错。
 
-`TIM2` 作为微秒计时器使用，当前关键参数应为：
+---
 
-- `Prescaler = 71`
-- `Period = 65535`
+## 4. 网络与上传参数配置
 
-在当前 `72 MHz` 条件下，`TIM2` 计数步进为 `1 us`，适合后续实现 `delay_us()` 与 `DHT11` 时序驱动。
+当前参数在 `App/Src/app_node.c` 顶部定义：
 
-### TIM3 用途
+- `APP_WIFI_SSID`
+- `APP_WIFI_PASSWORD`
+- `APP_UPLOAD_HOST`
+- `APP_UPLOAD_PORT`
 
-- `CH3` 输出 PWM 到 `PB0`
-- `CH4` 输出 PWM 到 `PB1`
+说明：
 
-用于电机或风扇调速。
+- `APP_UPLOAD_HOST` 应配置为上位机 IP。
+- 端口与上位机保持一致（当前上位机 TCP server 默认 `5000`）。
 
-### USART3
+---
 
-- 波特率当前为 `115200`
-- `PB10/PB11` 已映射为 `TX/RX`
-- 当前 CubeMX 中开启了 `USART3_IRQn`
+## 5. 协议摘要
 
-后续需要明确通信驱动到底采用：
+帧格式：
 
-- 轮询收发
-- 中断接收 + 环形缓冲区
+```text
+SOF0 SOF1 VER NODE CMD SEQ_L SEQ_H LEN_L LEN_H PAYLOAD CRC_L CRC_H
+```
 
-## 当前项目状态
+- `SOF0/SOF1` = `0xAA 0x55`
+- `VER` = `0x01`
+- `CRC16` 范围：从 `VER` 开始到 `PAYLOAD` 结束（不含 SOF 与 CRC 本身）
 
-截至当前阶段：
+当前关键命令：
 
-- CubeMX 工程可正常生成代码。
-- 工程已经能通过编译。
-- 外设分配与原理图当前版本基本一致。
-- `TIM2` 微秒计时参数已经修正。
-- 3 路继电器控制已经从错误的共用 `PB3` 改为独立控制。
+- `TELEMETRY (0x02)`：下位机上传
+- `CONTROL (0x03)`：上位机下发
+- `ACK (0x06)` / `ERR (0x07)`：双向响应
 
-## 建议的开发顺序
+主要 payload：
 
-建议按下面顺序推进，而不是同时展开所有模块。
+- `TELEMETRY`（8 字节）
+  - `[0..1]` `temp_x10`（int16 little-endian）
+  - `[2..3]` `hum_x10`（uint16 little-endian）
+  - `[4]` `mode`
+  - `[5]` `fan`
+  - `[6]` `online`
+  - `[7]` `usb_flags`
+- `CONTROL`（5 字节）
+  - `[0..1]` `target_temp_x10`
+  - `[2]` `mode`
+  - `[3]` `fan`
+  - `[4]` `usb_flags`
 
-1. 实现 `TIM2` 微秒延时函数，例如 `delay_us()`。
-2. 完成 `ESP-01S` 基础串口收发测试。
-3. 完成 `TIM3 + TB6612FNG` 的电机或风扇控制。
-4. 完成 `DHT11` 单总线驱动与温湿度读取。
-5. 完成 3 路继电器的独立开关控制。
-6. 统一定义与上位机对接的数据结构或协议帧。
+---
 
-## 第一版软件模块建议
+## 6. 串口与稳定性策略（当前版本）
 
-后续代码建议拆成如下模块：
+当前与稳定性相关的关键策略：
 
-- `bsp_delay.c/.h`
-  - 提供基于 `TIM2` 的 `delay_us()`
-- `bsp_esp01s.c/.h`
-  - 负责 `USART3` 基础收发与 AT 指令封装
-- `bsp_dht11.c/.h`
-  - 负责温湿度采集
-- `bsp_motor.c/.h`
-  - 负责 `TB6612FNG` 控制，包括方向与占空比
-- `bsp_relay.c/.h`
-  - 负责 `PB3/PB4/PB5` 三路继电器控制
-- `app_node.c/.h`
-  - 负责节点业务逻辑、状态组织和对外通信
+- ESP RX 使用 DMA 循环缓冲读取，减少 `WIFI CONNECTED` 等关键字符串被截断概率。
+- `+IPD` 字节流按状态机解析后再喂给协议解析器，避免串扰。
+- 控制回包优先，状态上报延迟发送，降低“控制与上报打架”。
+- TCP 失败优先尝试恢复连接，不立即 WiFi 全重连。
 
-## 后续实现时的注意事项
+---
 
-### DHT11
+## 7. 快速联调建议
 
-- `PA6` 不能一直固定成输入或输出。
-- 起始信号阶段需要输出。
-- 等待响应和读位阶段需要切成输入。
-- 需要严格的微秒级时序。
+建议顺序：
 
-### ESP-01S
+1. 下位机单独上电，串口确认 WiFi + TCP 能建立。
+2. 上位机再入网并启动服务。
+3. 先验证上行（TELEMETRY），再测下发（CONTROL）。
+4. 压测时避免无节制高频连点，逐步提高频率观察串口日志。
 
-- 建议先验证 `RST/EN/TX/RX` 是否工作正常，再开始接 WiFi 流程。
-- 第一版可以先做最简单的串口回显和 AT 测试。
+若出现频繁断连，优先检查：
 
-### 电机与风扇
+- 热点/AP 是否稳定。
+- 上下位机 IP/端口是否一致。
+- 是否误把下位机编成了错误节点 ID。
 
-- 建议先验证 `STBY` 拉高后，`AIN1/AIN2` 与 `BIN1/BIN2` 的逻辑方向是否符合实际硬件。
-- PWM 占空比建议从低速开始，避免上电即满速。
+---
 
-### 继电器
+## 8. 后续计划（建议）
 
-- 当前已经是独立 3 路控制。
-- 后续软件层应直接抽象成 `relay1/relay2/relay3`，不要再写成一个总开关。
-
-## 与上位机关系
-
-本项目对应的是智能家居系统中的下位机节点。
-上位机项目为 `HomePanel_test`，当前已经完成：
-
-- 图形界面
-- 触摸输入
-- RTC 时间显示
-- 本地 HVAC 模拟控制层
-
-后续下位机成熟后，需要与上位机统一：
-
-- 时间同步机制
-- 温湿度上报格式
-- 风扇控制指令
-- USB 供电控制指令
-- 节点状态上报机制
-
-## 给后续新线程或新窗口的说明
-
-如果以后在新的对话或新的开发进程里继续这个项目，优先记住以下事实：
-
-- 这是 `STM32F103C8T6` 下位机工程，不是上位机 GUI 工程。
-- 当前时钟目标是 `72 MHz`。
-- `TIM2` 是微秒计时器，`Prescaler = 71`。
-- `TIM3 CH3/CH4` 用于双路 PWM。
-- `USART3` 连接 `ESP-01S`。
-- `DHT11` 在 `PA6`。
-- `PB3/PB4/PB5` 是 3 路独立继电器控制。
-- 当前最合适的下一步是先写底层驱动，不要一开始就上 RTOS。
+- 将 `APP_WIFI_SSID/APP_WIFI_PASSWORD/APP_UPLOAD_HOST` 改为 NVM 参数，不再硬编码。
+- 增加连接状态指示与失败原因码上报。
+- 增加更细粒度的发送队列统计（丢包、重发、超时）。

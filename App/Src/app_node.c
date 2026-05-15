@@ -44,7 +44,13 @@
 #define APP_ESP_CIFSR_RETRY_MAX  3U
 #define APP_ESP_RX_SLICE_BYTES   64U
 #define APP_DEBUG_TX_TIMEOUT_MS  120U
-#define APP_NODE_ID              ((uint8_t)APP_HOME_NODE_KITCHEN)
+#ifndef APP_NODE_ID
+#define APP_NODE_ID              APP_HOME_NODE_KITCHEN
+#endif
+
+#if (APP_NODE_ID < APP_HOME_NODE_KITCHEN) || (APP_NODE_ID > APP_HOME_NODE_BEDROOM)
+#error "APP_NODE_ID must be 1(kitchen), 2(living), or 3(bedroom)"
+#endif
 #define APP_HOME_TELEMETRY_PAYLOAD_LEN 8U
 #define APP_HOME_ACK_PAYLOAD_LEN       1U
 #define APP_HOME_ERR_PAYLOAD_LEN       2U
