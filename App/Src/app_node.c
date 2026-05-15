@@ -20,7 +20,9 @@
 #define APP_UPLOAD_INTERVAL_MS   20000U
 #define APP_UPLOAD_RETRY_MS      20000U
 #define APP_STATE_UPLOAD_DEBOUNCE_MS 1500U
-#define APP_ESP_POST_IP_UPLOAD_DELAY_MS 25000U
+#define APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS 1200U
+#define APP_ESP_POST_IP_UPLOAD_DELAY_MS 8000U
+#define APP_CIPSTART_FAIL_RETRY_MS 6000U
 #define APP_UPLOAD_FAIL_REJOIN_THRESHOLD 6U
 #define APP_ESP_RESPONSE_SIZE    256U
 #define APP_ESP_CMD_TIMEOUT_MS   1500U
@@ -32,8 +34,9 @@
 #define APP_ESP_PRE_TCP_SETTLE_MS 300U
 #define APP_ESP_CIPSTART_PROBE_DELAY_MS 1000U
 #define APP_ESP_SEND_PROMPT_TIMEOUT_MS 2500U
-#define APP_ESP_SEND_ACK_TIMEOUT_MS    8000U
+#define APP_ESP_SEND_ACK_TIMEOUT_MS    12000U
 #define APP_ESP_POST_SEND_CLOSE_DELAY_MS 500U
+#define APP_ESP_TCP_REOPEN_SETTLE_MS   1500U
 #define APP_ESP_RESET_LOW_MS     100U
 #define APP_ESP_RESET_SETTLE_MS  3000U
 #define APP_ESP_JOIN_SETTLE_MS   3000U
@@ -171,6 +174,7 @@ static uint8_t s_tcpConnected = 0U;
 static uint32_t s_lastDhtPollTick = 0U;
 static uint32_t s_lastWifiAttemptTick = 0U;
 static uint32_t s_nextUploadAttemptTick = 0U;
+static uint32_t s_tcpReopenNotBeforeTick = 0U;
 static APP_EspState s_espState = APP_ESP_STATE_IDLE;
 static uint32_t s_espStateDeadlineTick = 0U;
 static uint8_t s_cwjapRetryCount = 0U;
@@ -404,7 +408,8 @@ static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick);
 static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick);
 static void app_esp_exchange_reset(void);
 static uint8_t app_upload_payload_is_protocol_reply(void);
-static void app_schedule_upload_close(uint32_t nowTick);
+static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason);
+static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason);
 
 static uint16_t app_read_le16(const uint8_t* data)
 {
@@ -619,6 +624,8 @@ static void app_apply_control_frame(APP_NodeContext* node, const APP_HomeProtoco
                   (unsigned int)s_controlMode,
                   (unsigned int)s_controlFan,
                   (unsigned int)flags);
+
+    app_schedule_state_upload(HAL_GetTick(), "control");
 }
 
 static void app_handle_protocol_frame(APP_NodeContext* node, const APP_HomeProtocolFrame_t* frame)
@@ -849,6 +856,17 @@ static void app_mark_current_send_success(APP_NodeContext* node, uint32_t nowTic
 {
     if (app_upload_payload_is_protocol_reply() != 0U)
     {
+        if (s_stateUploadPending != 0U)
+        {
+            uint32_t guardedReadyTick = nowTick + APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS;
+            if ((int32_t)(s_stateUploadReadyTick - guardedReadyTick) < 0)
+            {
+                s_stateUploadReadyTick = guardedReadyTick;
+                app_debug_log("[NET] defer state upload after reply %ums",
+                              (unsigned int)APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS);
+            }
+        }
+
         s_pendingReplyLength = 0U;
         s_pendingReplyKind = APP_SEND_KIND_NONE;
         app_debug_log("[NET] protocol reply ok");
@@ -878,13 +896,19 @@ static void app_mark_current_send_failure(APP_NodeContext* node, uint32_t nowTic
     app_mark_upload_failure(node, nowTick);
 }
 
-static void app_schedule_upload_close(uint32_t nowTick)
+static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason)
 {
+    if ((reason != 0) && (reason[0] != '\0'))
+    {
+        app_debug_log("%s", reason);
+    }
+
     s_payloadSentAfterMissingPrompt = 0U;
-    s_espStateDeadlineTick = nowTick + APP_ESP_POST_SEND_CLOSE_DELAY_MS;
+    s_tcpConnected = 0U;
+    s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
     app_esp_exchange_reset();
-    app_debug_log("[NET] close TCP after protocol reply");
-    s_espState = APP_ESP_STATE_UPLOAD_CMD_CLOSE;
+    app_mark_current_send_success(node, nowTick);
+    s_espState = APP_ESP_STATE_READY;
 }
 
 static void app_finish_upload_send_success_with_link(APP_NodeContext* node, uint32_t nowTick, uint8_t tcpConnected)
@@ -1456,20 +1480,34 @@ static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
     }
 }
 
-static void app_force_wifi_rejoin_after_uncertain_data_mode(uint32_t nowTick)
+static void app_recover_tcp_without_wifi_rejoin(APP_NodeContext* node, uint32_t nowTick, const char* reason)
 {
-    s_wifiConnected = 0U;
+    if ((reason != 0) && (reason[0] != '\0'))
+    {
+        app_debug_log("%s", reason);
+    }
+
     s_tcpConnected = 0U;
     s_payloadSentAfterMissingPrompt = 0U;
-    s_uploadPayloadLength = 0U;
+    s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+    app_mark_current_send_failure(node, nowTick);
     app_esp_exchange_reset();
+    s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+}
 
-    /*
-     * If ESP01S stayed in CIPSEND data mode, normal AT recovery can become
-     * TCP payload. A full Wi-Fi state-machine restart is slower but clean.
-     */
-    s_lastWifiAttemptTick = nowTick - APP_WIFI_RETRY_MS;
-    s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason)
+{
+    if ((reason != 0) && (reason[0] != '\0'))
+    {
+        app_debug_log("%s", reason);
+    }
+
+    s_tcpConnected = 0U;
+    s_payloadSentAfterMissingPrompt = 0U;
+    s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+    app_mark_current_send_failure(node, nowTick);
+    app_esp_exchange_reset();
+    s_espState = APP_ESP_STATE_READY;
 }
 
 static void app_update_runtime_view(APP_NodeContext* node)
@@ -1550,7 +1588,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 break;
             }
 
-            app_debug_log("[NET] wifi disconnected, retry join");
+            app_debug_log("[NET] wifi not connected, join AP");
             s_tcpConnected = 0U;
             s_cwjapRetryCount = 0U;
             s_lastWifiAttemptTick = nowTick;
@@ -1811,7 +1849,8 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 s_tcpConnected = 0U;
                 s_cifsrRetryCount = 0U;
                 s_nextUploadAttemptTick = nowTick + APP_ESP_POST_IP_UPLOAD_DELAY_MS;
-                app_debug_log("[NET] wifi ip confirmed, wait TCP stack settle");
+                app_debug_log("[NET] wifi ip confirmed, wait TCP stack settle %ums",
+                              (unsigned int)APP_ESP_POST_IP_UPLOAD_DELAY_MS);
                 s_espState = APP_ESP_STATE_WIFI_CMD_CIPSTATUS;
             }
             else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
@@ -1879,6 +1918,12 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             (void)app_esp_collect_response_slice(node, 0);
 
             if (s_uploadConfigured == 0U)
+            {
+                break;
+            }
+
+            if ((s_tcpConnected == 0U) &&
+                (app_tick_reached(nowTick, s_tcpReopenNotBeforeTick) == 0U))
             {
                 break;
             }
@@ -2020,9 +2065,11 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 }
                 else
                 {
-                    app_debug_log("[NET] CIPSTART failed, retry TCP later");
+                    app_debug_log("[NET] CIPSTART failed, retry TCP in %ums",
+                                  (unsigned int)APP_CIPSTART_FAIL_RETRY_MS);
                     s_tcpConnected = 0U;
                     app_mark_current_send_failure(node, nowTick);
+                    s_nextUploadAttemptTick = nowTick + APP_CIPSTART_FAIL_RETRY_MS;
                     s_espState = APP_ESP_STATE_READY;
                     app_esp_exchange_reset();
                 }
@@ -2063,9 +2110,9 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             {
                 if (app_esp_response_has_error(s_espExchange.response) == 0U)
                 {
-                    app_debug_log("[NET] CIPSEND prompt timeout, reset ESP");
-                    app_mark_current_send_failure(node, nowTick);
-                    app_force_wifi_rejoin_after_uncertain_data_mode(nowTick);
+                    app_recover_tcp_without_wifi_rejoin(node,
+                                                        nowTick,
+                                                        "[NET] CIPSEND prompt timeout, recover TCP");
                 }
                 else
                 {
@@ -2119,7 +2166,16 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             {
                 if (app_upload_payload_is_protocol_reply() != 0U)
                 {
-                    app_schedule_upload_close(nowTick);
+                    if (app_esp_response_has_close(s_espExchange.response) != 0U)
+                    {
+                        app_finish_upload_send_success_peer_closed(node,
+                                                                   nowTick,
+                                                                   "[NET] protocol reply peer-closed");
+                    }
+                    else
+                    {
+                        app_finish_upload_send_success(node, nowTick);
+                    }
                     break;
                 }
 
@@ -2133,7 +2189,16 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             {
                 if (app_upload_payload_is_protocol_reply() != 0U)
                 {
-                    app_schedule_upload_close(nowTick);
+                    if (app_esp_response_has_close(s_espExchange.response) != 0U)
+                    {
+                        app_finish_upload_send_success_peer_closed(node,
+                                                                   nowTick,
+                                                                   "[NET] protocol reply peer-closed");
+                    }
+                    else
+                    {
+                        app_finish_upload_send_success(node, nowTick);
+                    }
                     break;
                 }
 
@@ -2149,7 +2214,16 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 {
                     if (app_upload_payload_is_protocol_reply() != 0U)
                     {
-                        app_schedule_upload_close(nowTick);
+                        if (app_esp_response_has_close(s_espExchange.response) != 0U)
+                        {
+                            app_finish_upload_send_success_peer_closed(node,
+                                                                       nowTick,
+                                                                       "[NET] protocol reply peer-closed");
+                        }
+                        else
+                        {
+                            app_finish_upload_send_success(node, nowTick);
+                        }
                         break;
                     }
 
@@ -2161,34 +2235,62 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                          (app_esp_send_recv_seen(s_espExchange.response) != 0U))
                 {
                     app_debug_log("[NET] protocol reply accepted without SEND OK");
-                    app_schedule_upload_close(nowTick);
+                    if (app_esp_response_has_close(s_espExchange.response) != 0U)
+                    {
+                        app_finish_upload_send_success_peer_closed(node,
+                                                                   nowTick,
+                                                                   "[NET] protocol reply peer-closed");
+                    }
+                    else
+                    {
+                        /*
+                         * ESP acknowledged UART payload ("Recv xx bytes") but did not report SEND OK.
+                         * Treat reply as delivered, then force a clean TCP reopen before next payload
+                         * to avoid "link is not valid" on immediate follow-up telemetry.
+                         */
+                        s_payloadSentAfterMissingPrompt = 0U;
+                        s_tcpConnected = 0U;
+                        s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+                        app_esp_exchange_reset();
+                        app_mark_current_send_success(node, nowTick);
+                        s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                    }
                     break;
                 }
                 else if (app_esp_send_recv_accepted(s_espExchange.response) != 0U)
                 {
-                    app_debug_log("[NET] send accepted without SEND OK, reset ESP");
-                    app_mark_current_send_failure(node, nowTick);
-                    app_force_wifi_rejoin_after_uncertain_data_mode(nowTick);
+                    app_recover_tcp_without_wifi_rejoin(node,
+                                                        nowTick,
+                                                        "[NET] send accepted without SEND OK, recover TCP");
                 }
                 else if (app_esp_response_has_error(s_espExchange.response) == 0U)
                 {
                     if (s_payloadSentAfterMissingPrompt != 0U)
                     {
-                        app_debug_log("[NET] send ack timeout after missing prompt, reset ESP");
-                        app_mark_current_send_failure(node, nowTick);
-                        app_force_wifi_rejoin_after_uncertain_data_mode(nowTick);
+                        app_recover_tcp_without_wifi_rejoin(node,
+                                                            nowTick,
+                                                            "[NET] send ack timeout after missing prompt, recover TCP");
                         break;
                     }
 
-                    app_debug_log("[NET] send ack timeout, reset ESP");
-                    app_mark_current_send_failure(node, nowTick);
-                    app_force_wifi_rejoin_after_uncertain_data_mode(nowTick);
+                    app_recover_tcp_without_wifi_rejoin(node,
+                                                        nowTick,
+                                                        "[NET] send ack timeout, recover TCP");
                 }
                 else
                 {
-                    app_debug_log("[NET] send result not ok");
-                    app_mark_current_send_failure(node, nowTick);
-                    s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                    if (app_esp_response_has_close(s_espExchange.response) != 0U)
+                    {
+                        app_recover_tcp_after_peer_closed(node,
+                                                          nowTick,
+                                                          "[NET] send result peer-closed, recover TCP");
+                    }
+                    else
+                    {
+                        app_debug_log("[NET] send result not ok");
+                        app_mark_current_send_failure(node, nowTick);
+                        s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+                    }
                 }
             }
             break;
@@ -2219,6 +2321,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             }
 
             s_tcpConnected = 0U;
+            s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
             app_mark_current_send_success(node, nowTick);
             s_espState = APP_ESP_STATE_READY;
             break;
@@ -2239,6 +2342,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             }
 
             s_tcpConnected = 0U;
+            s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
             s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
             break;
 
@@ -2474,6 +2578,7 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     s_uploadOkCount = 0U;
     s_uploadFailCount = 0U;
     s_tcpConnected = 0U;
+    s_tcpReopenNotBeforeTick = 0U;
     s_cwjapRetryCount = 0U;
     s_cifsrRetryCount = 0U;
     s_protocolTxSequence = 1U;
