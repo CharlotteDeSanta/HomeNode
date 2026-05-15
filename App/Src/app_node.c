@@ -48,7 +48,7 @@
 #define APP_NODE_ID              APP_HOME_NODE_KITCHEN
 #endif
 
-#if (APP_NODE_ID < APP_HOME_NODE_KITCHEN) || (APP_NODE_ID > APP_HOME_NODE_BEDROOM)
+#if (APP_NODE_ID < 1) || (APP_NODE_ID > 3)
 #error "APP_NODE_ID must be 1(kitchen), 2(living), or 3(bedroom)"
 #endif
 #define APP_HOME_TELEMETRY_PAYLOAD_LEN 8U
