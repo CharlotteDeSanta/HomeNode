@@ -16,6 +16,10 @@
 #define APP_SELF_TEST_RELAY_ON_MS 3000U
 #define APP_SELF_TEST_RELAY_GAP_MS 500U
 #define APP_DHT11_POLL_MS        2500U
+#define APP_DHT11_TEMP_MIN_X10   0
+#define APP_DHT11_TEMP_MAX_X10   500
+#define APP_DHT11_HUM_MAX_X10    1000U
+#define APP_DHT11_TEMP_JUMP_REJECT_X10 25
 #define APP_WIFI_RETRY_MS        30000U
 #define APP_UPLOAD_INTERVAL_MS   20000U
 #define APP_UPLOAD_RETRY_MS      20000U
@@ -63,10 +67,13 @@
 #define APP_HOME_FAN_MED        2U
 #define APP_HOME_FAN_HIGH       3U
 #define APP_HOME_FAN_AUTO       4U
-#define APP_HOME_FAN_DUTY_LOW   35U
-#define APP_HOME_FAN_DUTY_MED   60U
-#define APP_HOME_FAN_DUTY_HIGH  100U
-#define APP_HOME_FAN_DUTY_AUTO  60U
+#define APP_HOME_FAN_DUTY_LOW   25U
+#define APP_HOME_FAN_DUTY_MED   45U
+#define APP_HOME_FAN_DUTY_HIGH  70U
+#define APP_HOME_FAN_DUTY_AUTO  45U
+#define APP_HOME_AUTO_FAN_DELTA_LOW_X10   10
+#define APP_HOME_AUTO_FAN_DELTA_MED_X10   20
+#define APP_HOME_AUTO_FAN_DELTA_HIGH_X10  30
 
 /*
  * Fill these values locally before Wi-Fi debug:
@@ -168,7 +175,11 @@ static APP_ButtonState s_buttons[APP_BUTTON_COUNT] =
 static uint8_t s_relayState[3] = {0U, 0U, 0U};
 static uint8_t s_fanEnabled = 0U;
 static uint8_t s_fanDutyPercent = 60U;
+static uint8_t s_runtimeFan = APP_HOME_FAN_OFF;
 static uint8_t s_dht11Valid = 0U;
+static uint8_t s_lastSensorSampleValid = 0U;
+static int16_t s_lastTemperatureX10 = 0;
+static uint16_t s_lastHumidityX10 = 0U;
 static uint8_t s_wifiConfigured = 0U;
 static uint8_t s_uploadConfigured = 0U;
 static uint8_t s_wifiConnected = 0U;
@@ -201,9 +212,9 @@ static uint8_t s_payloadSentAfterMissingPrompt = 0U;
 static uint8_t s_pendingReplyFrame[APP_HOME_PROTOCOL_MAX_FRAME_LEN];
 static uint16_t s_pendingReplyLength = 0U;
 static APP_SendKind s_pendingReplyKind = APP_SEND_KIND_NONE;
-static int16_t s_targetTemperatureX10 = 240;
+static int16_t s_targetTemperatureX10 = 250;
 static uint8_t s_controlMode = APP_HOME_MODE_AUTO;
-static uint8_t s_controlFan = APP_HOME_FAN_MED;
+static uint8_t s_controlFan = APP_HOME_FAN_AUTO;
 static const char s_ipdToken[] = "+IPD,";
 static UART_HandleTypeDef* s_debugUart = 0;
 
@@ -500,6 +511,76 @@ static uint8_t app_fan_mode_to_duty(uint8_t fan)
     }
 }
 
+static int16_t app_get_current_temperature_x10(const APP_NodeContext* node)
+{
+    if (node == 0)
+    {
+        return 0;
+    }
+
+    return (int16_t)(((int16_t)node->dht11.temperatureInt * 10) + (int16_t)node->dht11.temperatureDec);
+}
+
+static uint8_t app_get_auto_runtime_fan_from_delta(int16_t deltaX10)
+{
+    if (deltaX10 <= 0)
+    {
+        return APP_HOME_FAN_OFF;
+    }
+
+    if (deltaX10 >= APP_HOME_AUTO_FAN_DELTA_HIGH_X10)
+    {
+        return APP_HOME_FAN_HIGH;
+    }
+
+    if (deltaX10 >= APP_HOME_AUTO_FAN_DELTA_MED_X10)
+    {
+        return APP_HOME_FAN_MED;
+    }
+
+    if (deltaX10 >= APP_HOME_AUTO_FAN_DELTA_LOW_X10)
+    {
+        return APP_HOME_FAN_LOW;
+    }
+
+    return APP_HOME_FAN_LOW;
+}
+
+static uint8_t app_get_effective_fan_mode(const APP_NodeContext* node)
+{
+    if ((s_controlMode == APP_HOME_MODE_OFF) || (s_controlFan == APP_HOME_FAN_OFF))
+    {
+        return APP_HOME_FAN_OFF;
+    }
+
+    if (s_controlFan == APP_HOME_FAN_AUTO)
+    {
+        const int16_t currentTempX10 = app_get_current_temperature_x10(node);
+        const int16_t deltaX10 = (int16_t)(currentTempX10 - s_targetTemperatureX10);
+        return app_get_auto_runtime_fan_from_delta(deltaX10);
+    }
+
+    if (s_controlFan <= APP_HOME_FAN_HIGH)
+    {
+        return s_controlFan;
+    }
+
+    return APP_HOME_FAN_OFF;
+}
+
+static void app_refresh_fan_runtime(APP_NodeContext* node)
+{
+    const uint8_t effectiveFan = app_get_effective_fan_mode(node);
+
+    s_runtimeFan = effectiveFan;
+    s_fanEnabled = (effectiveFan != APP_HOME_FAN_OFF) ? 1U : 0U;
+    s_fanDutyPercent = app_fan_mode_to_duty(effectiveFan);
+    if ((s_fanEnabled != 0U) && (s_fanDutyPercent == 0U))
+    {
+        s_fanDutyPercent = APP_HOME_FAN_DUTY_LOW;
+    }
+}
+
 static void app_queue_protocol_reply(uint8_t command,
                                      uint16_t sequence,
                                      const uint8_t* payload,
@@ -607,19 +688,7 @@ static void app_apply_control_frame(APP_NodeContext* node, const APP_HomeProtoco
         (void)app_apply_relay_state(relayIndex);
     }
 
-    if ((s_controlMode == APP_HOME_MODE_OFF) || (s_controlFan == APP_HOME_FAN_OFF))
-    {
-        s_fanEnabled = 0U;
-    }
-    else
-    {
-        s_fanEnabled = 1U;
-        s_fanDutyPercent = app_fan_mode_to_duty(s_controlFan);
-        if (s_fanDutyPercent == 0U)
-        {
-            s_fanDutyPercent = APP_HOME_FAN_DUTY_AUTO;
-        }
-    }
+    app_refresh_fan_runtime(node);
     node->fanDutyPercent = s_fanDutyPercent;
     app_apply_fan_state();
 
@@ -814,7 +883,7 @@ static uint16_t app_build_telemetry_frame(APP_NodeContext* node, uint8_t* output
     app_write_le16(&payload[0], (uint16_t)temperatureX10);
     app_write_le16(&payload[2], humidityX10);
     payload[4] = s_controlMode;
-    payload[5] = s_controlFan;
+    payload[5] = s_runtimeFan;
     payload[6] = 1U;
     payload[7] = app_current_relay_flags();
 
@@ -833,7 +902,7 @@ static uint16_t app_build_telemetry_frame(APP_NodeContext* node, uint8_t* output
                       (int)temperatureX10,
                       (unsigned int)humidityX10,
                       (unsigned int)s_controlMode,
-                      (unsigned int)s_controlFan,
+                      (unsigned int)s_runtimeFan,
                       (unsigned int)payload[7]);
     }
 
@@ -1532,6 +1601,10 @@ static void app_update_runtime_view(APP_NodeContext* node)
 
 static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
 {
+    int16_t temperatureX10;
+    uint16_t humidityX10;
+    uint8_t sampleValid = 0U;
+
     if (node == 0)
     {
         return;
@@ -1545,7 +1618,80 @@ static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
     s_lastDhtPollTick = nowTick;
     if (BSP_DHT11_Read(&node->dht11) == HAL_OK)
     {
-        s_dht11Valid = 1U;
+        temperatureX10 = app_get_current_temperature_x10(node);
+        humidityX10 = (uint16_t)(((uint16_t)node->dht11.humidityInt * 10U) + (uint16_t)node->dht11.humidityDec);
+        sampleValid = 1U;
+
+        if ((temperatureX10 < APP_DHT11_TEMP_MIN_X10) ||
+            (temperatureX10 > APP_DHT11_TEMP_MAX_X10) ||
+            (humidityX10 > APP_DHT11_HUM_MAX_X10))
+        {
+            sampleValid = 0U;
+        }
+
+        if ((sampleValid != 0U) && (s_lastSensorSampleValid != 0U))
+        {
+            int16_t delta = (int16_t)(temperatureX10 - s_lastTemperatureX10);
+            if (delta < 0)
+            {
+                delta = (int16_t)(-delta);
+            }
+
+            if (delta > APP_DHT11_TEMP_JUMP_REJECT_X10)
+            {
+                sampleValid = 0U;
+            }
+        }
+
+        if (sampleValid != 0U)
+        {
+            s_lastTemperatureX10 = temperatureX10;
+            s_lastHumidityX10 = humidityX10;
+            s_lastSensorSampleValid = 1U;
+            s_dht11Valid = 1U;
+        }
+        else if (s_lastSensorSampleValid != 0U)
+        {
+            node->dht11.temperatureInt = (uint8_t)(s_lastTemperatureX10 / 10);
+            node->dht11.temperatureDec = (uint8_t)(s_lastTemperatureX10 % 10);
+            node->dht11.humidityInt = (uint8_t)(s_lastHumidityX10 / 10U);
+            node->dht11.humidityDec = (uint8_t)(s_lastHumidityX10 % 10U);
+            s_dht11Valid = 1U;
+            app_debug_log("[DHT] reject spike temp_x10=%d hum_x10=%u keep temp_x10=%d hum_x10=%u",
+                          (int)temperatureX10,
+                          (unsigned int)humidityX10,
+                          (int)s_lastTemperatureX10,
+                          (unsigned int)s_lastHumidityX10);
+        }
+        else
+        {
+            s_dht11Valid = 0U;
+            app_debug_log("[DHT] invalid sample without history temp_x10=%d hum_x10=%u",
+                          (int)temperatureX10,
+                          (unsigned int)humidityX10);
+        }
+
+        if ((s_dht11Valid != 0U) && (s_controlFan == APP_HOME_FAN_AUTO))
+        {
+            const uint8_t previousRuntimeFan = s_runtimeFan;
+            app_refresh_fan_runtime(node);
+            if (s_runtimeFan != previousRuntimeFan)
+            {
+                const int16_t currentTempX10 = app_get_current_temperature_x10(node);
+                const int16_t deltaX10 = (int16_t)(currentTempX10 - s_targetTemperatureX10);
+                app_debug_log("[AUTO] temp_x10=%d target_x10=%d delta_x10=%d fan=%u duty=%u%%",
+                              (int)currentTempX10,
+                              (int)s_targetTemperatureX10,
+                              (int)deltaX10,
+                              (unsigned int)s_runtimeFan,
+                              (unsigned int)s_fanDutyPercent);
+                app_apply_fan_state();
+            }
+            else
+            {
+                app_apply_fan_state();
+            }
+        }
     }
     else
     {
@@ -2575,7 +2721,11 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     app_set_all_relay_states(0U, "init off");
     s_fanEnabled = 0U;
     s_fanDutyPercent = 60U;
+    s_runtimeFan = APP_HOME_FAN_OFF;
     s_dht11Valid = 0U;
+    s_lastSensorSampleValid = 0U;
+    s_lastTemperatureX10 = 0;
+    s_lastHumidityX10 = 0U;
     s_wifiConfigured = app_is_wifi_configured();
     s_uploadConfigured = app_is_upload_configured();
     s_wifiConnected = 0U;
@@ -2596,9 +2746,9 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     s_payloadSentAfterMissingPrompt = 0U;
     s_pendingReplyLength = 0U;
     s_pendingReplyKind = APP_SEND_KIND_NONE;
-    s_targetTemperatureX10 = 240;
+    s_targetTemperatureX10 = 250;
     s_controlMode = APP_HOME_MODE_AUTO;
-    s_controlFan = APP_HOME_FAN_MED;
+    s_controlFan = APP_HOME_FAN_AUTO;
     app_ipd_parser_reset();
     APP_HomeProtocol_InitParser(&s_protocolParser);
     node->dht11Valid = 0U;
@@ -2694,17 +2844,12 @@ void APP_Node_Process(APP_NodeContext* node)
 
     if (app_button_pressed_event(&s_buttons[3], nowTick) != 0U)
     {
-        s_fanEnabled ^= 1U;
-        if (s_fanEnabled == 0U)
-        {
-            s_controlFan = APP_HOME_FAN_OFF;
-        }
-        else if (s_controlFan == APP_HOME_FAN_OFF)
-        {
-            s_controlFan = APP_HOME_FAN_AUTO;
-            s_fanDutyPercent = APP_HOME_FAN_DUTY_AUTO;
-        }
-        app_debug_log("[KEY] PA3 toggle fan -> %u", (unsigned int)s_fanEnabled);
+        s_controlMode = APP_HOME_MODE_AUTO;
+        s_controlFan = APP_HOME_FAN_AUTO;
+        app_refresh_fan_runtime(node);
+        app_debug_log("[KEY] PA3 force fan AUTO runtime=%u duty=%u%%",
+                      (unsigned int)s_runtimeFan,
+                      (unsigned int)s_fanDutyPercent);
         app_apply_fan_state();
         app_schedule_state_upload(nowTick, "fan");
     }
