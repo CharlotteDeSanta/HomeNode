@@ -26,7 +26,9 @@
 #define APP_STATE_UPLOAD_DEBOUNCE_MS 1500U
 #define APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS 1200U
 #define APP_ESP_POST_IP_UPLOAD_DELAY_MS 8000U
-#define APP_CIPSTART_FAIL_RETRY_MS 6000U
+#define APP_CIPSTART_FAIL_RETRY_BASE_MS 1200U
+#define APP_CIPSTART_FAIL_RETRY_MAX_MS  7000U
+#define APP_CIPSTART_FAIL_RETRY_JITTER_MS 400U
 #define APP_UPLOAD_FAIL_REJOIN_THRESHOLD 6U
 #define APP_ESP_RESPONSE_SIZE    256U
 #define APP_ESP_CMD_TIMEOUT_MS   1500U
@@ -48,6 +50,11 @@
 #define APP_ESP_CIFSR_RETRY_MAX  3U
 #define APP_ESP_RX_SLICE_BYTES   64U
 #define APP_DEBUG_TX_TIMEOUT_MS  120U
+#define APP_NODE_LOG_VERBOSE_PROTO 0U
+#define APP_NODE_LOG_VERBOSE_ESP_CMD 0U
+#define APP_NODE_LOG_VERBOSE_ESP_RSP 0U
+#define APP_NODE_LOG_VERBOSE_TX_HEX 0U
+#define APP_NODE_LOG_VERBOSE_AUTO 0U
 #ifndef APP_NODE_ID
 #define APP_NODE_ID              APP_HOME_NODE_KITCHEN
 #endif
@@ -187,6 +194,7 @@ static uint8_t s_uploadFailStreak = 0U;
 static uint8_t s_lastUploadOk = 0U;
 static uint16_t s_uploadOkCount = 0U;
 static uint16_t s_uploadFailCount = 0U;
+static uint8_t s_cipstartFailCount = 0U;
 static uint8_t s_tcpConnected = 0U;
 static uint32_t s_lastDhtPollTick = 0U;
 static uint32_t s_lastWifiAttemptTick = 0U;
@@ -427,6 +435,8 @@ static void app_esp_exchange_reset(void);
 static uint8_t app_upload_payload_is_protocol_reply(void);
 static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason);
 static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason);
+static uint32_t app_cipstart_retry_delay_ms(uint32_t nowTick);
+static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick);
 
 static uint16_t app_read_le16(const uint8_t* data)
 {
@@ -621,9 +631,11 @@ static void app_queue_protocol_ack(const APP_HomeProtocolFrame_t* frame)
                              payload,
                              (uint16_t)sizeof(payload),
                              APP_SEND_KIND_ACK);
+#if APP_NODE_LOG_VERBOSE_PROTO
     app_debug_log("[PROTO] ack queued seq=%u cmd=%s",
                   (unsigned int)frame->sequence,
                   APP_HomeProtocol_CommandToString(frame->command));
+#endif
 }
 
 static void app_queue_protocol_error(const APP_HomeProtocolFrame_t* frame,
@@ -712,11 +724,13 @@ static void app_handle_protocol_frame(APP_NodeContext* node, const APP_HomeProto
         return;
     }
 
+#if APP_NODE_LOG_VERBOSE_PROTO
     app_debug_log("[PROTO] rx node=%u cmd=%s seq=%u len=%u",
                   (unsigned int)frame->node,
                   APP_HomeProtocol_CommandToString(frame->command),
                   (unsigned int)frame->sequence,
                   (unsigned int)frame->length);
+#endif
 
     if ((frame->command == APP_HOME_CMD_ACK) || (frame->command == APP_HOME_CMD_ERR))
     {
@@ -897,6 +911,7 @@ static uint16_t app_build_telemetry_frame(APP_NodeContext* node, uint8_t* output
                                               outputSize);
     if (frameLength != 0U)
     {
+#if APP_NODE_LOG_VERBOSE_PROTO
         app_debug_log("[PROTO] telemetry tx seq=%u temp_x10=%d hum_x10=%u mode=%u fan=%u flags=0x%02X",
                       (unsigned int)sequence,
                       (int)temperatureX10,
@@ -904,6 +919,7 @@ static uint16_t app_build_telemetry_frame(APP_NodeContext* node, uint8_t* output
                       (unsigned int)s_controlMode,
                       (unsigned int)s_runtimeFan,
                       (unsigned int)payload[7]);
+#endif
     }
 
     return frameLength;
@@ -937,24 +953,32 @@ static void app_mark_current_send_success(APP_NodeContext* node, uint32_t nowTic
             if ((int32_t)(s_stateUploadReadyTick - guardedReadyTick) < 0)
             {
                 s_stateUploadReadyTick = guardedReadyTick;
+#if APP_NODE_LOG_VERBOSE_PROTO
                 app_debug_log("[NET] defer state upload after reply %ums",
                               (unsigned int)APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS);
+#endif
             }
         }
 
         s_pendingReplyLength = 0U;
         s_pendingReplyKind = APP_SEND_KIND_NONE;
+#if APP_NODE_LOG_VERBOSE_PROTO
         app_debug_log("[NET] protocol reply ok");
+#endif
     }
     else
     {
+#if APP_NODE_LOG_VERBOSE_PROTO
         app_debug_log("[NET] telemetry ok");
+#endif
         if ((s_uploadPayloadStateGeneration != 0U) &&
             (s_uploadPayloadStateGeneration == s_stateUploadGeneration))
         {
             s_stateUploadPending = 0U;
             s_stateUploadReadyTick = 0U;
+#if APP_NODE_LOG_VERBOSE_PROTO
             app_debug_log("[NET] state upload synced");
+#endif
         }
     }
 
@@ -1265,7 +1289,9 @@ static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
 
         if ((command != 0) && (command[0] != '\0'))
         {
+#if APP_NODE_LOG_VERBOSE_ESP_CMD
             app_debug_log("[ESP CMD] %s", command);
+#endif
             status = BSP_ESP01S_SendString(&node->esp, command, APP_ESP_CMD_TIMEOUT_MS);
             if (status != HAL_OK)
             {
@@ -1278,13 +1304,18 @@ static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
 
     /* Subsequent entries: collect a small RX slice and evaluate completion. */
     rxUpdated = app_esp_collect_response_slice(node, &s_espExchange);
+#if !APP_NODE_LOG_VERBOSE_ESP_RSP
+    (void)rxUpdated;
+#endif
 
     if (app_esp_response_has_expect(s_espExchange.response, expect1, expect2) != 0U)
     {
+#if APP_NODE_LOG_VERBOSE_ESP_RSP
         if (rxUpdated != 0U)
         {
             app_debug_log_response("[ESP RSP] ", s_espExchange.response);
         }
+#endif
         app_esp_exchange_deactivate();
         return APP_ESP_EXCHANGE_OK;
     }
@@ -1398,6 +1429,57 @@ static uint8_t app_esp_cipstart_likely_connected(const char* response)
     return 0U;
 }
 
+static uint8_t app_esp_cipstatus_likely_tcp_connected(const char* response)
+{
+    if ((response == 0) || (response[0] == '\0'))
+    {
+        return 0U;
+    }
+
+    if ((strstr(response, "STATUS:3") != 0) ||
+        (strstr(response, "+CIPSTATUS:") != 0) ||
+        (strstr(response, "ALREADY CONNECTED") != 0))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static uint8_t app_esp_cipstatus_likely_wifi_connected(const char* response)
+{
+    if ((response == 0) || (response[0] == '\0'))
+    {
+        return 0U;
+    }
+
+    if ((strstr(response, "STATUS:2") != 0) ||
+        (strstr(response, "STATUS:3") != 0) ||
+        (strstr(response, "STAIP") != 0))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static uint8_t app_esp_cipstatus_likely_wifi_lost(const char* response)
+{
+    if ((response == 0) || (response[0] == '\0'))
+    {
+        return 0U;
+    }
+
+    if ((strstr(response, "STATUS:5") != 0) ||
+        (strstr(response, "STATUS:1") != 0) ||
+        (strstr(response, "WIFI DISCONNECT") != 0))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
 static uint8_t app_esp_cifsr_likely_ok(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1422,6 +1504,57 @@ static uint8_t app_esp_cifsr_likely_ok(const char* response)
     }
 
     return 0U;
+}
+
+static uint32_t app_cipstart_retry_delay_ms(uint32_t nowTick)
+{
+    uint32_t delayMs = APP_CIPSTART_FAIL_RETRY_BASE_MS;
+    uint8_t step = (s_cipstartFailCount > 0U) ? (uint8_t)(s_cipstartFailCount - 1U) : 0U;
+    uint32_t jitterMs;
+
+    while ((step > 0U) && (delayMs < APP_CIPSTART_FAIL_RETRY_MAX_MS))
+    {
+        if (delayMs > (APP_CIPSTART_FAIL_RETRY_MAX_MS / 2U))
+        {
+            delayMs = APP_CIPSTART_FAIL_RETRY_MAX_MS;
+            break;
+        }
+        delayMs <<= 1;
+        step--;
+    }
+
+    if (delayMs > APP_CIPSTART_FAIL_RETRY_MAX_MS)
+    {
+        delayMs = APP_CIPSTART_FAIL_RETRY_MAX_MS;
+    }
+
+    jitterMs = (nowTick ^
+                ((uint32_t)APP_NODE_ID << 7) ^
+                ((uint32_t)s_protocolTxSequence * 33U)) %
+               (APP_CIPSTART_FAIL_RETRY_JITTER_MS + 1U);
+    return delayMs + jitterMs;
+}
+
+static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick)
+{
+    uint32_t retryDelayMs;
+
+    if (s_cipstartFailCount < 0xFFU)
+    {
+        s_cipstartFailCount++;
+    }
+
+    retryDelayMs = app_cipstart_retry_delay_ms(nowTick);
+    app_debug_log("[NET] CIPSTART failed, sync TCP then retry in %lums (n=%u)",
+                  (unsigned long)retryDelayMs,
+                  (unsigned int)s_cipstartFailCount);
+
+    s_tcpConnected = 0U;
+    app_mark_current_send_failure(node, nowTick);
+    s_nextUploadAttemptTick = nowTick + retryDelayMs;
+    s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+    s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
+    app_esp_exchange_reset();
 }
 
 static uint8_t app_esp_wifi_join_likely_ok(const char* response)
@@ -1515,6 +1648,7 @@ static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick)
 {
     s_lastUploadOk = 1U;
     s_uploadFailStreak = 0U;
+    s_cipstartFailCount = 0U;
     s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
     if (s_uploadOkCount < 0xFFFFU)
     {
@@ -1677,6 +1811,7 @@ static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
             app_refresh_fan_runtime(node);
             if (s_runtimeFan != previousRuntimeFan)
             {
+#if APP_NODE_LOG_VERBOSE_AUTO
                 const int16_t currentTempX10 = app_get_current_temperature_x10(node);
                 const int16_t deltaX10 = (int16_t)(currentTempX10 - s_targetTemperatureX10);
                 app_debug_log("[AUTO] temp_x10=%d target_x10=%d delta_x10=%d fan=%u duty=%u%%",
@@ -1685,6 +1820,7 @@ static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
                               (int)deltaX10,
                               (unsigned int)s_runtimeFan,
                               (unsigned int)s_fanDutyPercent);
+#endif
                 app_apply_fan_state();
             }
             else
@@ -1999,6 +2135,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 }
                 s_wifiConnected = 1U;
                 s_tcpConnected = 0U;
+                s_cipstartFailCount = 0U;
                 s_cifsrRetryCount = 0U;
                 s_nextUploadAttemptTick = nowTick + APP_ESP_POST_IP_UPLOAD_DELAY_MS;
                 app_debug_log("[NET] wifi ip confirmed, wait TCP stack settle %ums",
@@ -2128,8 +2265,8 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             }
 
             /*
-             * Keep the socket alive; repeated CIPCLOSE can leave ESP8266 stuck in CLOSE/busy state.
-             * AT+PING is unreliable here and can leave a stale ERR before TCP, so open TCP directly.
+             * Keep the socket alive once established.
+             * For a fresh session, go directly to CIPSTART to avoid extra PING timeout stalls.
              */
             s_payloadSentAfterMissingPrompt = 0U;
             s_espState = (s_tcpConnected != 0U) ?
@@ -2199,6 +2336,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                  (app_esp_cipstart_likely_connected(s_espExchange.response) != 0U)))
             {
                 s_tcpConnected = 1U;
+                s_cipstartFailCount = 0U;
                 if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
                 {
                     app_debug_log("[NET] CIPSTART uncertain, continue CIPSEND");
@@ -2217,13 +2355,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 }
                 else
                 {
-                    app_debug_log("[NET] CIPSTART failed, retry TCP in %ums",
-                                  (unsigned int)APP_CIPSTART_FAIL_RETRY_MS);
-                    s_tcpConnected = 0U;
-                    app_mark_current_send_failure(node, nowTick);
-                    s_nextUploadAttemptTick = nowTick + APP_CIPSTART_FAIL_RETRY_MS;
-                    s_espState = APP_ESP_STATE_READY;
-                    app_esp_exchange_reset();
+                    app_schedule_cipstart_retry(node, nowTick);
                 }
             }
             break;
@@ -2288,7 +2420,9 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                                      (const uint8_t*)s_uploadPayload,
                                      s_uploadPayloadLength,
                                      APP_ESP_CMD_TIMEOUT_MS);
+#if APP_NODE_LOG_VERBOSE_TX_HEX
             app_debug_log_hex("[NET] tx hex", s_uploadPayload, s_uploadPayloadLength);
+#endif
             if (status != HAL_OK)
             {
                 app_debug_log("[NET] payload tx failed");
@@ -2479,13 +2613,16 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_UPLOAD_RECOVER_CLOSE:
-            /* Recovery path: try close once, then fall back to READY / reconnect flow. */
+            /*
+             * Recovery path: sync real ESP TCP status first, then decide whether to
+             * reopen TCP or rejoin Wi-Fi. This avoids blind CIPCLOSE loops after CLOSE/ERR.
+             */
             exchangeResult = app_esp_step_exchange(node,
                                                    nowTick,
                                                    (uint32_t)APP_ESP_STATE_UPLOAD_RECOVER_CLOSE,
-                                                   "AT+CIPCLOSE\r\n",
+                                                   "AT+CIPSTATUS\r\n",
                                                    "OK",
-                                                   "CLOSED",
+                                                   0,
                                                    APP_ESP_CMD_TIMEOUT_MS,
                                                    1U);
             if (exchangeResult == APP_ESP_EXCHANGE_BUSY)
@@ -2493,9 +2630,36 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 break;
             }
 
-            s_tcpConnected = 0U;
-            s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
-            s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
+            if (app_esp_cipstatus_likely_wifi_lost(s_espExchange.response) != 0U)
+            {
+                app_debug_log("[NET] CIPSTATUS: wifi lost, rejoin");
+                s_wifiConnected = 0U;
+                s_tcpConnected = 0U;
+                s_lastWifiAttemptTick = nowTick;
+                s_espState = APP_ESP_STATE_WIFI_WAIT_RETRY;
+            }
+            else if (app_esp_cipstatus_likely_tcp_connected(s_espExchange.response) != 0U)
+            {
+                app_debug_log("[NET] CIPSTATUS: tcp active, reuse session");
+                s_tcpConnected = 1U;
+                s_cipstartFailCount = 0U;
+                s_espState = APP_ESP_STATE_READY;
+            }
+            else if (app_esp_cipstatus_likely_wifi_connected(s_espExchange.response) != 0U)
+            {
+                app_debug_log("[NET] CIPSTATUS: wifi ok, tcp closed");
+                s_tcpConnected = 0U;
+                s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+                s_espState = APP_ESP_STATE_READY;
+            }
+            else
+            {
+                app_debug_log("[NET] CIPSTATUS unclear, assume tcp closed");
+                s_tcpConnected = 0U;
+                s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+                s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
+            }
+            app_esp_exchange_reset();
             break;
 
         default:
