@@ -23,6 +23,7 @@
 #define APP_WIFI_RETRY_MS        30000U
 #define APP_UPLOAD_INTERVAL_MS   20000U
 #define APP_UPLOAD_RETRY_MS      20000U
+#define APP_UPLOAD_SCHEDULE_JITTER_MS 350U
 #define APP_STATE_UPLOAD_DEBOUNCE_MS 1500U
 #define APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS 1200U
 #define APP_ESP_POST_IP_UPLOAD_DELAY_MS 8000U
@@ -90,6 +91,7 @@
 #define APP_WIFI_SSID     "WXSC_Air"
 #define APP_WIFI_PASSWORD ""
 #define APP_UPLOAD_HOST   "10.20.209.130"
+// #define APP_UPLOAD_HOST   "10.20.138.230"
 #define APP_UPLOAD_PORT   5000U
 
 typedef struct
@@ -437,6 +439,7 @@ static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, ui
 static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason);
 static uint32_t app_cipstart_retry_delay_ms(uint32_t nowTick);
 static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick);
+static uint32_t app_upload_schedule_jitter_ms(uint32_t nowTick);
 
 static uint16_t app_read_le16(const uint8_t* data)
 {
@@ -1195,26 +1198,6 @@ static uint8_t app_esp_response_has_error(const char* response)
         return 1U;
     }
 
-    if (strstr(response, "CLOSED") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "CLOSE") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "CLOS") != 0)
-    {
-        return 1U;
-    }
-
-    if (strstr(response, "LOSE") != 0)
-    {
-        return 1U;
-    }
-
     if (strstr(response, "link is not valid") != 0)
     {
         return 1U;
@@ -1376,10 +1359,16 @@ static uint8_t app_esp_response_has_close(const char* response)
         return 0U;
     }
 
-    return ((strstr(response, "CLOSED") != 0) ||
-            (strstr(response, "CLOSE") != 0) ||
-            (strstr(response, "CLOS") != 0) ||
-            (strstr(response, "LOSE") != 0)) ? 1U : 0U;
+    /*
+     * Match only stable close tokens to avoid false-positive close detection
+     * from noisy UART fragments.
+     */
+    return ((strstr(response, ",CLOSED") != 0) ||
+            (strstr(response, "\r\nCLOSED\r\n") != 0) ||
+            (strstr(response, "\nCLOSED\r\n") != 0) ||
+            (strstr(response, "\r\nCLOSE\r\n") != 0) ||
+            (strstr(response, "\nCLOSE\r\n") != 0) ||
+            (strstr(response, "CLOSED\r\n") != 0)) ? 1U : 0U;
 }
 
 static uint8_t app_esp_send_ok_likely(const char* response)
@@ -1557,6 +1546,14 @@ static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick)
     app_esp_exchange_reset();
 }
 
+static uint32_t app_upload_schedule_jitter_ms(uint32_t nowTick)
+{
+    return (uint32_t)((nowTick ^
+                       ((uint32_t)APP_NODE_ID << 9) ^
+                       ((uint32_t)s_protocolTxSequence * 17U)) %
+                      (APP_UPLOAD_SCHEDULE_JITTER_MS + 1U));
+}
+
 static uint8_t app_esp_wifi_join_likely_ok(const char* response)
 {
     uint8_t hasConnected = 0U;
@@ -1646,10 +1643,12 @@ static uint8_t app_esp_wifi_join_likely_ok(const char* response)
 
 static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick)
 {
+    uint32_t scheduleJitterMs = app_upload_schedule_jitter_ms(nowTick);
+
     s_lastUploadOk = 1U;
     s_uploadFailStreak = 0U;
     s_cipstartFailCount = 0U;
-    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS;
+    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_INTERVAL_MS + scheduleJitterMs;
     if (s_uploadOkCount < 0xFFFFU)
     {
         s_uploadOkCount++;
@@ -1663,6 +1662,8 @@ static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick)
 
 static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
 {
+    uint32_t scheduleJitterMs = app_upload_schedule_jitter_ms(nowTick);
+
     (void)node;
 
     s_lastUploadOk = 0U;
@@ -1677,7 +1678,7 @@ static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
         s_uploadFailStreak++;
     }
 
-    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS;
+    s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS + scheduleJitterMs;
 
     if (s_uploadFailStreak >= APP_UPLOAD_FAIL_REJOIN_THRESHOLD)
     {
@@ -1685,7 +1686,7 @@ static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
                       (unsigned int)APP_UPLOAD_FAIL_REJOIN_THRESHOLD);
         s_uploadFailStreak = 0U;
         s_tcpConnected = 0U;
-        s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS;
+        s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS + scheduleJitterMs;
     }
 }
 
@@ -2545,9 +2546,27 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 }
                 else if (app_esp_send_recv_accepted(s_espExchange.response) != 0U)
                 {
-                    app_recover_tcp_without_wifi_rejoin(node,
-                                                        nowTick,
-                                                        "[NET] send accepted without SEND OK, recover TCP");
+                    /*
+                     * UART accepted payload bytes but SEND OK is missing.
+                     * To avoid retry storms, treat this send as tentatively delivered,
+                     * then reopen TCP softly before the next upload.
+                     */
+                    app_debug_log("[NET] send accepted without SEND OK, keep payload and soft-reopen TCP");
+                    if (app_esp_response_has_close(s_espExchange.response) != 0U)
+                    {
+                        app_finish_upload_send_success_peer_closed(node,
+                                                                   nowTick,
+                                                                   "[NET] send accepted then peer-closed");
+                    }
+                    else
+                    {
+                        s_payloadSentAfterMissingPrompt = 0U;
+                        s_tcpConnected = 0U;
+                        s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+                        app_esp_exchange_reset();
+                        app_mark_current_send_success(node, nowTick);
+                        s_espState = APP_ESP_STATE_READY;
+                    }
                 }
                 else if (app_esp_response_has_error(s_espExchange.response) == 0U)
                 {
@@ -2654,9 +2673,9 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             }
             else
             {
-                app_debug_log("[NET] CIPSTATUS unclear, assume tcp closed");
+                app_debug_log("[NET] CIPSTATUS unclear, keep WiFi and delay tcp reopen");
                 s_tcpConnected = 0U;
-                s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
+                s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS + 500U;
                 s_espState = (s_wifiConnected != 0U) ? APP_ESP_STATE_READY : APP_ESP_STATE_WIFI_WAIT_RETRY;
             }
             app_esp_exchange_reset();
@@ -2962,7 +2981,7 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     s_lastDhtPollTick = nowTick;
     s_lastWifiAttemptTick = nowTick - APP_WIFI_RETRY_MS;
     node->lastTelemetryTick = nowTick - APP_UPLOAD_INTERVAL_MS;
-    s_nextUploadAttemptTick = nowTick;
+    s_nextUploadAttemptTick = nowTick + ((uint32_t)(APP_NODE_ID - 1U) * 600U);
     app_debug_log("[NET] cfg ssid=\"%s\" passLen=%u host=\"%s\" port=%lu",
                   APP_WIFI_SSID,
                   (unsigned int)strlen(APP_WIFI_PASSWORD),
