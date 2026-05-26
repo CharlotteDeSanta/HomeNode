@@ -25,6 +25,7 @@ static void APP_HomeProtocol_ResetParser(APP_HomeProtocolParser_t *parser,
   parser->lastError = error;
 }
 
+/* Initialize parser state before consuming a new byte stream. */
 void APP_HomeProtocol_InitParser(APP_HomeProtocolParser_t *parser)
 {
   if (parser == NULL)
@@ -41,6 +42,13 @@ APP_HomeProtocolParseResult_t APP_HomeProtocol_PushByte(APP_HomeProtocolParser_t
                                                         uint8_t byte,
                                                         APP_HomeProtocolFrame_t *frame)
 {
+  /*
+   * Streaming parser for UART/TCP byte flow:
+   * - lock on SOF0/SOF1
+   * - validate fixed header + payload length
+   * - verify CRC over version..payload
+   * - emit one complete frame and reset parser state
+   */
   uint16_t payloadLength = 0U;
   uint16_t totalLength = 0U;
   uint16_t expectedCrc = 0U;
@@ -152,6 +160,11 @@ uint16_t APP_HomeProtocol_BuildFrame(uint8_t node,
                                      uint8_t *output,
                                      uint16_t outputSize)
 {
+  /*
+   * Build one protocol frame in output buffer:
+   * [SOF][VER][NODE][CMD][SEQ][LEN][PAYLOAD][CRC16]
+   * Returns 0 when arguments or buffer size are invalid.
+   */
   uint16_t totalLength = 0U;
   uint16_t crc = 0U;
 
@@ -188,6 +201,7 @@ uint16_t APP_HomeProtocol_BuildFrame(uint8_t node,
   return totalLength;
 }
 
+/* Compute CRC16 (Modbus polynomial) over protocol payload region. */
 uint16_t APP_HomeProtocol_Crc16(const uint8_t *data, uint16_t length)
 {
   uint16_t crc = 0xFFFFU;
@@ -218,6 +232,7 @@ uint16_t APP_HomeProtocol_Crc16(const uint8_t *data, uint16_t length)
   return crc;
 }
 
+/* Convert protocol command id to human-readable string for logging/tracing. */
 const char *APP_HomeProtocol_CommandToString(uint8_t command)
 {
   switch (command)

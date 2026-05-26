@@ -228,17 +228,20 @@ static uint8_t s_controlFan = APP_HOME_FAN_AUTO;
 static const char s_ipdToken[] = "+IPD,";
 static UART_HandleTypeDef* s_debugUart = 0;
 
+/* Check whether compile-time WiFi credentials are present for AP join. */
 static uint8_t app_is_wifi_configured(void)
 {
     /* Empty password is valid for open APs; only SSID is mandatory. */
     return (APP_WIFI_SSID[0] != '\0') ? 1U : 0U;
 }
 
+/* Check whether compile-time upload host endpoint is configured. */
 static uint8_t app_is_upload_configured(void)
 {
     return (APP_UPLOAD_HOST[0] != '\0') ? 1U : 0U;
 }
 
+/* Emit one formatted debug log line over selected debug UART. */
 static void app_debug_log(const char* format, ...)
 {
     char buffer[192];
@@ -381,6 +384,7 @@ static uint8_t app_button_pressed_event(APP_ButtonState* button, uint32_t nowTic
     return 0U;
 }
 
+/* Print desired relay states to help compare software intent vs hardware behavior. */
 static void app_log_relay_expected_state(const char* reason)
 {
     app_debug_log("[RLY] %s RLY1=%u RLY2=%u RLY3=%u",
@@ -390,6 +394,7 @@ static void app_log_relay_expected_state(const char* reason)
                   (unsigned int)s_relayState[2]);
 }
 
+/* Apply one relay channel state to hardware and log expected aggregate state. */
 static HAL_StatusTypeDef app_apply_relay_state(uint8_t relayIndex)
 {
     HAL_StatusTypeDef status;
@@ -399,6 +404,7 @@ static HAL_StatusTypeDef app_apply_relay_state(uint8_t relayIndex)
     return status;
 }
 
+/* Force all relay channels to a unified ON/OFF state (POST/self-test convenience path). */
 static void app_set_all_relay_states(uint8_t enable, const char* reason)
 {
     uint8_t state = (enable != 0U) ? 1U : 0U;
@@ -410,6 +416,7 @@ static void app_set_all_relay_states(uint8_t enable, const char* reason)
     app_log_relay_expected_state(reason);
 }
 
+/* Push current runtime fan enable/duty decision to motor driver hardware. */
 static void app_apply_fan_state(void)
 {
     uint16_t pulse;
@@ -490,6 +497,7 @@ static uint8_t app_current_relay_flags(void)
     return flags;
 }
 
+/* Debounce-triggered state upload scheduler to collapse bursty local state changes. */
 static void app_schedule_state_upload(uint32_t nowTick, const char* reason)
 {
     s_stateUploadPending = 1U;
@@ -534,8 +542,13 @@ static int16_t app_get_current_temperature_x10(const APP_NodeContext* node)
     return (int16_t)(((int16_t)node->dht11.temperatureInt * 10) + (int16_t)node->dht11.temperatureDec);
 }
 
+/* Map temperature delta to AUTO runtime fan step (OFF/LOW/MED/HIGH). */
 static uint8_t app_get_auto_runtime_fan_from_delta(int16_t deltaX10)
 {
+    /*
+     * Auto fan policy by temperature delta (current - target):
+     * <=0: OFF, >=+1.0C: LOW, >=+2.0C: MED, >=+3.0C: HIGH.
+     */
     if (deltaX10 <= 0)
     {
         return APP_HOME_FAN_OFF;
@@ -559,8 +572,15 @@ static uint8_t app_get_auto_runtime_fan_from_delta(int16_t deltaX10)
     return APP_HOME_FAN_LOW;
 }
 
+/* Resolve effective runtime fan mode from current control mode/fan and temperature delta. */
 static uint8_t app_get_effective_fan_mode(const APP_NodeContext* node)
 {
+    /*
+     * Resolve runtime fan mode from control state:
+     * - OFF mode or OFF fan command always wins
+     * - AUTO fan uses local sensor delta mapping
+     * - Manual LOW/MED/HIGH is applied directly
+     */
     if ((s_controlMode == APP_HOME_MODE_OFF) || (s_controlFan == APP_HOME_FAN_OFF))
     {
         return APP_HOME_FAN_OFF;
@@ -581,6 +601,7 @@ static uint8_t app_get_effective_fan_mode(const APP_NodeContext* node)
     return APP_HOME_FAN_OFF;
 }
 
+/* Recompute runtime fan mode + PWM duty from current control mode and sensor state. */
 static void app_refresh_fan_runtime(APP_NodeContext* node)
 {
     const uint8_t effectiveFan = app_get_effective_fan_mode(node);
@@ -594,6 +615,7 @@ static void app_refresh_fan_runtime(APP_NodeContext* node)
     }
 }
 
+/* Build and stage one ACK/ERR protocol reply for prioritized transmission. */
 static void app_queue_protocol_reply(uint8_t command,
                                      uint16_t sequence,
                                      const uint8_t* payload,
@@ -619,6 +641,7 @@ static void app_queue_protocol_reply(uint8_t command,
     s_pendingReplyKind = kind;
 }
 
+/* Queue ACK reply for a successfully processed inbound command frame. */
 static void app_queue_protocol_ack(const APP_HomeProtocolFrame_t* frame)
 {
     uint8_t payload[APP_HOME_ACK_PAYLOAD_LEN];
@@ -641,6 +664,7 @@ static void app_queue_protocol_ack(const APP_HomeProtocolFrame_t* frame)
 #endif
 }
 
+/* Queue ERR reply when inbound command validation or execution fails. */
 static void app_queue_protocol_error(const APP_HomeProtocolFrame_t* frame,
                                      APP_HomeProtocolError_t error)
 {
@@ -667,8 +691,16 @@ static void app_queue_protocol_error(const APP_HomeProtocolFrame_t* frame,
                   (unsigned int)error);
 }
 
+/* Apply validated CONTROL frame to local state, outputs, and follow-up upload scheduling. */
 static void app_apply_control_frame(APP_NodeContext* node, const APP_HomeProtocolFrame_t* frame)
 {
+    /*
+     * Apply one CONTROL frame atomically:
+     * - update target/mode/fan control fields
+     * - map output flags to relay states
+     * - recompute runtime fan + PWM
+     * - schedule an immediate state upload to acknowledge effect
+     */
     int16_t target;
     uint8_t mode;
     uint8_t fan;
@@ -718,8 +750,14 @@ static void app_apply_control_frame(APP_NodeContext* node, const APP_HomeProtoco
     app_schedule_state_upload(HAL_GetTick(), "control");
 }
 
+/* Validate and dispatch one decoded protocol frame addressed to this node. */
 static void app_handle_protocol_frame(APP_NodeContext* node, const APP_HomeProtocolFrame_t* frame)
 {
+    /*
+     * Command gate for frames addressed to this node.
+     * ACK/ERR are terminal notifications (no reply). CONTROL triggers state
+     * changes and then returns ACK/ERR according to validation result.
+     */
     APP_HomeProtocolError_t error = APP_HOME_ERR_NONE;
 
     if ((node == 0) || (frame == 0))
@@ -778,10 +816,12 @@ static void app_handle_protocol_frame(APP_NodeContext* node, const APP_HomeProto
     app_queue_protocol_ack(frame);
 }
 
+/* Feed a single payload byte into protocol parser and process full frames when completed. */
 static void app_feed_protocol_byte(APP_NodeContext* node, uint8_t byte)
 {
     APP_HomeProtocolParseResult_t result;
 
+    /* Byte stream -> frame parser -> command dispatcher. */
     result = APP_HomeProtocol_PushByte(&s_protocolParser, byte, &s_protocolFrame);
     if (result == APP_HOME_PARSE_FRAME)
     {
@@ -793,6 +833,7 @@ static void app_feed_protocol_byte(APP_NodeContext* node, uint8_t byte)
     }
 }
 
+/* Reset +IPD parser state machine used to extract binary payload from AT text stream. */
 static void app_ipd_parser_reset(void)
 {
     s_ipdParser.state = APP_IPD_STATE_IDLE;
@@ -800,6 +841,7 @@ static void app_ipd_parser_reset(void)
     s_ipdParser.remaining = 0U;
 }
 
+/* Classify UART RX byte as AT text or +IPD payload and route accordingly. */
 static uint8_t app_esp_process_rx_byte(APP_NodeContext* node, uint8_t byte)
 {
     if (node == 0)
@@ -807,6 +849,10 @@ static uint8_t app_esp_process_rx_byte(APP_NodeContext* node, uint8_t byte)
         return 1U;
     }
 
+    /*
+     * ESP +IPD stream parser:
+     * isolates raw payload bytes from textual AT response lines.
+     */
     switch (s_ipdParser.state)
     {
         case APP_IPD_STATE_IDLE:
@@ -881,6 +927,7 @@ static uint8_t app_esp_process_rx_byte(APP_NodeContext* node, uint8_t byte)
     }
 }
 
+/* Build TELEMETRY frame containing current sensor/control/runtime output snapshot. */
 static uint16_t app_build_telemetry_frame(APP_NodeContext* node, uint8_t* output, uint16_t outputSize)
 {
     uint8_t payload[APP_HOME_TELEMETRY_PAYLOAD_LEN];
@@ -928,6 +975,7 @@ static uint16_t app_build_telemetry_frame(APP_NodeContext* node, uint8_t* output
     return frameLength;
 }
 
+/* Promote pending ACK/ERR frame into active upload payload buffer. */
 static void app_prepare_pending_reply_payload(void)
 {
     if ((s_pendingReplyKind == APP_SEND_KIND_NONE) || (s_pendingReplyLength == 0U))
@@ -940,12 +988,14 @@ static void app_prepare_pending_reply_payload(void)
     s_uploadPayloadKind = s_pendingReplyKind;
 }
 
+/* Check whether current upload payload is ACK/ERR reply instead of telemetry frame. */
 static uint8_t app_upload_payload_is_protocol_reply(void)
 {
     return ((s_uploadPayloadKind == APP_SEND_KIND_ACK) ||
             (s_uploadPayloadKind == APP_SEND_KIND_ERR)) ? 1U : 0U;
 }
 
+/* Commit successful send outcome and reconcile pending state-upload generation tracking. */
 static void app_mark_current_send_success(APP_NodeContext* node, uint32_t nowTick)
 {
     if (app_upload_payload_is_protocol_reply() != 0U)
@@ -990,6 +1040,7 @@ static void app_mark_current_send_success(APP_NodeContext* node, uint32_t nowTic
     app_mark_upload_success(node, nowTick);
 }
 
+/* Commit failed send outcome and route to shared upload-failure accounting path. */
 static void app_mark_current_send_failure(APP_NodeContext* node, uint32_t nowTick)
 {
     s_uploadPayloadKind = APP_SEND_KIND_NONE;
@@ -998,6 +1049,7 @@ static void app_mark_current_send_failure(APP_NodeContext* node, uint32_t nowTic
     app_mark_upload_failure(node, nowTick);
 }
 
+/* Finalize successful send path when peer closes socket right after payload transfer. */
 static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason)
 {
     if ((reason != 0) && (reason[0] != '\0'))
@@ -1013,6 +1065,7 @@ static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, ui
     s_espState = APP_ESP_STATE_READY;
 }
 
+/* Finalize successful send path and explicitly set resulting TCP link state flag. */
 static void app_finish_upload_send_success_with_link(APP_NodeContext* node, uint32_t nowTick, uint8_t tcpConnected)
 {
     s_payloadSentAfterMissingPrompt = 0U;
@@ -1022,6 +1075,7 @@ static void app_finish_upload_send_success_with_link(APP_NodeContext* node, uint
     s_espState = APP_ESP_STATE_READY;
 }
 
+/* Finalize successful send path while preserving current TCP link state. */
 static void app_finish_upload_send_success(APP_NodeContext* node, uint32_t nowTick)
 {
     app_finish_upload_send_success_with_link(node, nowTick, 1U);
@@ -1073,11 +1127,13 @@ static HAL_StatusTypeDef app_post_relay_test(void)
     return HAL_OK;
 }
 
+/* Wrap-safe deadline comparison helper for tick-based scheduling. */
 static uint8_t app_tick_reached(uint32_t nowTick, uint32_t targetTick)
 {
     return ((int32_t)(nowTick - targetTick) >= 0) ? 1U : 0U;
 }
 
+/* Reset full AT exchange context including buffered response bytes. */
 static void app_esp_exchange_reset(void)
 {
     s_espExchange.active = 0U;
@@ -1087,6 +1143,7 @@ static void app_esp_exchange_reset(void)
     s_espExchange.response[0] = '\0';
 }
 
+/* Deactivate current AT exchange while preserving buffered response for diagnostics. */
 static void app_esp_exchange_deactivate(void)
 {
     s_espExchange.active = 0U;
@@ -1094,6 +1151,7 @@ static void app_esp_exchange_deactivate(void)
     s_espExchange.deadlineTick = 0U;
 }
 
+/* Drain stale UART RX bytes before issuing a new AT command step. */
 static void app_esp_rx_discard_slice(APP_NodeContext* node, uint16_t maxBytes)
 {
     uint16_t index;
@@ -1114,6 +1172,7 @@ static void app_esp_rx_discard_slice(APP_NodeContext* node, uint16_t maxBytes)
     }
 }
 
+/* Collect a bounded UART RX slice and optionally append non-IPD bytes to exchange buffer. */
 static uint8_t app_esp_collect_response_slice(APP_NodeContext* node,
                                               APP_EspExchangeContext* exchange)
 {
@@ -1151,6 +1210,7 @@ static uint8_t app_esp_collect_response_slice(APP_NodeContext* node,
     return (readCount > 0U) ? 1U : 0U;
 }
 
+/* Heuristically detect error signatures from possibly truncated ESP AT responses. */
 static uint8_t app_esp_response_has_error(const char* response)
 {
     if (response == 0)
@@ -1233,6 +1293,7 @@ static uint8_t app_esp_response_has_expect(const char* response,
     return 0U;
 }
 
+/* Non-blocking AT step executor: send-once, slice RX, then return BUSY/OK/FAIL. */
 static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
                                                    uint32_t nowTick,
                                                    uint32_t tag,
@@ -1320,6 +1381,7 @@ static APP_EspExchangeResult app_esp_step_exchange(APP_NodeContext* node,
     return APP_ESP_EXCHANGE_BUSY;
 }
 
+/* Detect "Recv xx bytes" acceptance without requiring final SEND OK token. */
 static uint8_t app_esp_send_recv_accepted(const char* response)
 {
     if (response == 0)
@@ -1341,6 +1403,7 @@ static uint8_t app_esp_send_recv_accepted(const char* response)
     return 1U;
 }
 
+/* Detect whether ESP reported payload receive progress marker at all. */
 static uint8_t app_esp_send_recv_seen(const char* response)
 {
     if (response == 0)
@@ -1352,6 +1415,7 @@ static uint8_t app_esp_send_recv_seen(const char* response)
             (strstr(response, "Recv") != 0)) ? 1U : 0U;
 }
 
+/* Detect TCP close indicators inside ESP AT response text. */
 static uint8_t app_esp_response_has_close(const char* response)
 {
     if (response == 0)
@@ -1371,6 +1435,7 @@ static uint8_t app_esp_response_has_close(const char* response)
             (strstr(response, "CLOSED\r\n") != 0)) ? 1U : 0U;
 }
 
+/* Detect successful send markers in full or partially-truncated ESP responses. */
 static uint8_t app_esp_send_ok_likely(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1389,6 +1454,7 @@ static uint8_t app_esp_send_ok_likely(const char* response)
     return 0U;
 }
 
+/* Detect likely successful CIPSTART even when response is incomplete/noisy. */
 static uint8_t app_esp_cipstart_likely_connected(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1418,6 +1484,7 @@ static uint8_t app_esp_cipstart_likely_connected(const char* response)
     return 0U;
 }
 
+/* Parse CIPSTATUS text for state indicating active TCP connection. */
 static uint8_t app_esp_cipstatus_likely_tcp_connected(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1435,6 +1502,7 @@ static uint8_t app_esp_cipstatus_likely_tcp_connected(const char* response)
     return 0U;
 }
 
+/* Parse CIPSTATUS text for states indicating WiFi is connected but TCP may be closed. */
 static uint8_t app_esp_cipstatus_likely_wifi_connected(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1452,6 +1520,7 @@ static uint8_t app_esp_cipstatus_likely_wifi_connected(const char* response)
     return 0U;
 }
 
+/* Parse CIPSTATUS text for states indicating WiFi link has been lost. */
 static uint8_t app_esp_cipstatus_likely_wifi_lost(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1469,6 +1538,7 @@ static uint8_t app_esp_cipstatus_likely_wifi_lost(const char* response)
     return 0U;
 }
 
+/* Detect whether CIFSR response likely contains valid station IP information. */
 static uint8_t app_esp_cifsr_likely_ok(const char* response)
 {
     if ((response == 0) || (response[0] == '\0'))
@@ -1495,6 +1565,7 @@ static uint8_t app_esp_cifsr_likely_ok(const char* response)
     return 0U;
 }
 
+/* Compute CIPSTART retry backoff with bounded growth and jitter. */
 static uint32_t app_cipstart_retry_delay_ms(uint32_t nowTick)
 {
     uint32_t delayMs = APP_CIPSTART_FAIL_RETRY_BASE_MS;
@@ -1524,6 +1595,7 @@ static uint32_t app_cipstart_retry_delay_ms(uint32_t nowTick)
     return delayMs + jitterMs;
 }
 
+/* Schedule TCP reopen retry after CIPSTART failure without full WiFi reset. */
 static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick)
 {
     uint32_t retryDelayMs;
@@ -1546,6 +1618,7 @@ static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick)
     app_esp_exchange_reset();
 }
 
+/* Compute deterministic jitter to de-phase multiple node upload attempts. */
 static uint32_t app_upload_schedule_jitter_ms(uint32_t nowTick)
 {
     return (uint32_t)((nowTick ^
@@ -1554,6 +1627,7 @@ static uint32_t app_upload_schedule_jitter_ms(uint32_t nowTick)
                       (APP_UPLOAD_SCHEDULE_JITTER_MS + 1U));
 }
 
+/* Heuristically accept WiFi join success when ESP response is truncated/noisy. */
 static uint8_t app_esp_wifi_join_likely_ok(const char* response)
 {
     uint8_t hasConnected = 0U;
@@ -1641,6 +1715,7 @@ static uint8_t app_esp_wifi_join_likely_ok(const char* response)
     return 0U;
 }
 
+/* Record upload success and schedule next periodic telemetry attempt with jitter. */
 static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick)
 {
     uint32_t scheduleJitterMs = app_upload_schedule_jitter_ms(nowTick);
@@ -1660,6 +1735,7 @@ static void app_mark_upload_success(APP_NodeContext* node, uint32_t nowTick)
     }
 }
 
+/* Record upload failure and choose retry timing without immediate WiFi teardown. */
 static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
 {
     uint32_t scheduleJitterMs = app_upload_schedule_jitter_ms(nowTick);
@@ -1680,6 +1756,10 @@ static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
 
     s_nextUploadAttemptTick = nowTick + APP_UPLOAD_RETRY_MS + scheduleJitterMs;
 
+    /*
+     * Too many consecutive upload failures means TCP session is unhealthy.
+     * Keep current Wi-Fi link and switch to delayed TCP-only recovery path.
+     */
     if (s_uploadFailStreak >= APP_UPLOAD_FAIL_REJOIN_THRESHOLD)
     {
         app_debug_log("[NET] upload fail streak reached %u, keep WiFi and retry TCP later",
@@ -1690,8 +1770,10 @@ static void app_mark_upload_failure(APP_NodeContext* node, uint32_t nowTick)
     }
 }
 
+/* Trigger TCP-only recovery path while preserving current WiFi association. */
 static void app_recover_tcp_without_wifi_rejoin(APP_NodeContext* node, uint32_t nowTick, const char* reason)
 {
+    /* Soft recovery: keep AP association, rebuild TCP state machine only. */
     if ((reason != 0) && (reason[0] != '\0'))
     {
         app_debug_log("%s", reason);
@@ -1705,8 +1787,10 @@ static void app_recover_tcp_without_wifi_rejoin(APP_NodeContext* node, uint32_t 
     s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
 }
 
+/* Trigger recovery flow when peer-closed is observed after transmission. */
 static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason)
 {
+    /* Peer-closed recovery can return directly to READY and reopen on demand. */
     if ((reason != 0) && (reason[0] != '\0'))
     {
         app_debug_log("%s", reason);
@@ -1720,6 +1804,7 @@ static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t no
     s_espState = APP_ESP_STATE_READY;
 }
 
+/* Publish internal connectivity/upload counters into externally visible node context. */
 static void app_update_runtime_view(APP_NodeContext* node)
 {
     if (node == 0)
@@ -1734,8 +1819,16 @@ static void app_update_runtime_view(APP_NodeContext* node)
     node->uploadFailCount = s_uploadFailCount;
 }
 
+/* Periodically sample DHT11 with validation/filtering and update runtime fan decisions. */
 static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
 {
+    /*
+     * Periodic DHT11 acquisition with spike rejection:
+     * - drop out-of-range samples
+     * - reject abrupt jumps against last accepted value
+     * - fall back to last good sample when available
+     * - refresh AUTO fan runtime from local sensor data
+     */
     int16_t temperatureX10;
     uint16_t humidityX10;
     uint8_t sampleValid = 0U;
@@ -1838,8 +1931,16 @@ static void app_poll_dht11(APP_NodeContext* node, uint32_t nowTick)
     node->dht11Valid = s_dht11Valid;
 }
 
+/* Run one iteration of WiFi/TCP/upload state machine without blocking foreground logic. */
 static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
 {
+    /*
+     * Central ESP8266 AT state machine:
+     * - maintain Wi-Fi association
+     * - establish/recover TCP session
+     * - send telemetry or protocol replies
+     * - classify failures and choose reconnect path without blocking main loop
+     */
     APP_EspExchangeResult exchangeResult;
     HAL_StatusTypeDef status;
     int payloadLength;
@@ -1870,6 +1971,10 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
 
     switch (s_espState)
     {
+        /*
+         * Wi-Fi bring-up stages:
+         * RESET -> AT baseline -> station config -> CWJAP -> CIFSR verification.
+         */
         case APP_ESP_STATE_WIFI_WAIT_RETRY:
             /* Global reconnect gate to avoid aggressive reset/AT storms. */
             if (app_tick_reached(nowTick, s_lastWifiAttemptTick + APP_WIFI_RETRY_MS) == 0U)
@@ -1910,6 +2015,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_WIFI_CMD_AT:
+            /* Minimal liveness probe before sending heavier config sequence. */
             exchangeResult = app_esp_step_exchange(node,
                                                    nowTick,
                                                    (uint32_t)APP_ESP_STATE_WIFI_CMD_AT,
@@ -2197,7 +2303,15 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             }
             break;
 
+        /*
+         * Upload stages:
+         * READY scheduler -> (optional) CIPSTART -> CIPSEND -> payload -> SEND OK.
+         */
         case APP_ESP_STATE_READY:
+            /*
+             * Scheduling gate for outbound traffic:
+             * prefer pending protocol replies, then state-upload event, then periodic telemetry.
+             */
             if (s_wifiConnected == 0U)
             {
                 s_tcpConnected = 0U;
@@ -2601,6 +2715,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_UPLOAD_CMD_CLOSE:
+            /* Best-effort close to realign ESP TCP state before next open attempt. */
             (void)app_esp_collect_response_slice(node, 0);
             if (app_tick_reached(nowTick, s_espStateDeadlineTick) == 0U)
             {
@@ -2690,6 +2805,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
     app_update_runtime_view(node);
 }
 
+/* Update self-test pass/fail bitmasks for the requested test item. */
 static void app_self_test_mark(APP_NodeContext* node, APP_SelfTestItem item, HAL_StatusTypeDef status)
 {
     if (node == 0)
@@ -2719,6 +2835,7 @@ static uint32_t app_self_test_required_mask(void)
            (uint32_t)APP_SELF_TEST_ITEM_RELAY3;
 }
 
+/* Check whether all required test items completed successfully. */
 static uint8_t app_test_result_passed(const APP_TestResult* result, uint32_t requiredMask)
 {
     if (result == 0)
@@ -2739,6 +2856,7 @@ static uint8_t app_test_result_passed(const APP_TestResult* result, uint32_t req
     return ((result->passMask & requiredMask) == requiredMask) ? 1U : 0U;
 }
 
+/* Log compact summary for POST or self-test result state. */
 static void app_log_test_summary(const char* name, const APP_TestResult* result, uint32_t requiredMask)
 {
     if ((name == 0) || (result == 0))
@@ -2753,6 +2871,7 @@ static void app_log_test_summary(const char* name, const APP_TestResult* result,
                   (unsigned int)app_test_result_passed(result, requiredMask));
 }
 
+/* Run one relay channel self-test pulse sequence and validate driver interaction. */
 static HAL_StatusTypeDef app_self_test_relay(uint8_t relayIndex)
 {
     HAL_StatusTypeDef status;
@@ -2807,6 +2926,7 @@ void APP_Node_RunHardwareSelfTest(APP_NodeContext* node)
     app_log_test_summary("SELF", &node->selfTest, app_self_test_required_mask());
 }
 
+/* Capture initial GPIO button levels to seed debounce state machine baseline. */
 static void app_capture_button_baseline(uint32_t nowTick)
 {
     uint32_t index;
