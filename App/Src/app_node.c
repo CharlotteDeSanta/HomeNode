@@ -21,15 +21,17 @@
 #define APP_DHT11_HUM_MAX_X10    1000U
 #define APP_DHT11_TEMP_JUMP_REJECT_X10 25
 #define APP_WIFI_RETRY_MS        30000U
-#define APP_UPLOAD_INTERVAL_MS   20000U
-#define APP_UPLOAD_RETRY_MS      20000U
-#define APP_UPLOAD_SCHEDULE_JITTER_MS 350U
-#define APP_STATE_UPLOAD_DEBOUNCE_MS 1500U
+#define APP_UPLOAD_INTERVAL_MS   6000U
+#define APP_UPLOAD_RETRY_MS      6000U
+#define APP_UPLOAD_SCHEDULE_JITTER_MS 1800U
+#define APP_STATE_UPLOAD_DEBOUNCE_MS 800U
 #define APP_PROTOCOL_REPLY_UPLOAD_GUARD_MS 1200U
 #define APP_ESP_POST_IP_UPLOAD_DELAY_MS 8000U
-#define APP_CIPSTART_FAIL_RETRY_BASE_MS 1200U
-#define APP_CIPSTART_FAIL_RETRY_MAX_MS  7000U
-#define APP_CIPSTART_FAIL_RETRY_JITTER_MS 400U
+#define APP_CIPSTART_FAIL_RETRY_BASE_MS 2500U
+#define APP_CIPSTART_FAIL_RETRY_MAX_MS  15000U
+#define APP_CIPSTART_FAIL_RETRY_JITTER_MS 1000U
+#define APP_ESP_POST_IP_NODE_STAGGER_MS 2500U
+#define APP_STATE_UPLOAD_NODE_STAGGER_MS 900U
 #define APP_UPLOAD_FAIL_REJOIN_THRESHOLD 6U
 #define APP_ESP_RESPONSE_SIZE    256U
 #define APP_ESP_CMD_TIMEOUT_MS   1500U
@@ -39,7 +41,6 @@
 #define APP_ESP_TCP_TIMEOUT_MS   8000U
 #define APP_ESP_PING_TIMEOUT_MS  5000U
 #define APP_ESP_PRE_TCP_SETTLE_MS 300U
-#define APP_ESP_CIPSTART_PROBE_DELAY_MS 1000U
 #define APP_ESP_SEND_PROMPT_TIMEOUT_MS 2500U
 #define APP_ESP_SEND_ACK_TIMEOUT_MS    12000U
 #define APP_ESP_POST_SEND_CLOSE_DELAY_MS 500U
@@ -90,8 +91,8 @@
  */
 #define APP_WIFI_SSID     "WXSC_Air"
 #define APP_WIFI_PASSWORD ""
-#define APP_UPLOAD_HOST   "10.20.209.130"
-// #define APP_UPLOAD_HOST   "10.20.138.230"
+#define APP_UPLOAD_HOST   "10.20.250.232"
+// #define APP_UPLOAD_HOST   "10.215.95.32"
 #define APP_UPLOAD_PORT   5000U
 
 typedef struct
@@ -125,7 +126,6 @@ typedef enum
     APP_ESP_STATE_UPLOAD_CMD_PING,
     APP_ESP_STATE_UPLOAD_PING_SETTLE,
     APP_ESP_STATE_UPLOAD_CMD_CIPSTART,
-    APP_ESP_STATE_UPLOAD_CIPSTART_SETTLE,
     APP_ESP_STATE_UPLOAD_CMD_CIPSEND,
     APP_ESP_STATE_UPLOAD_SEND_PAYLOAD,
     APP_ESP_STATE_UPLOAD_WAIT_SEND_OK,
@@ -317,6 +317,7 @@ static void app_debug_log_response(const char* prefix, const char* response)
     app_debug_log("%s%s", (prefix != 0) ? prefix : "", line);
 }
 
+#if APP_NODE_LOG_VERBOSE_TX_HEX
 static void app_debug_log_hex(const char* prefix, const uint8_t* data, uint16_t length)
 {
     char line[192];
@@ -351,6 +352,7 @@ static void app_debug_log_hex(const char* prefix, const uint8_t* data, uint16_t 
 
     app_debug_log("%s", line);
 }
+#endif
 
 static uint8_t app_read_button(uint16_t pin)
 {
@@ -446,6 +448,8 @@ static void app_finish_upload_send_success_peer_closed(APP_NodeContext* node, ui
 static void app_recover_tcp_after_peer_closed(APP_NodeContext* node, uint32_t nowTick, const char* reason);
 static uint32_t app_cipstart_retry_delay_ms(uint32_t nowTick);
 static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick);
+static uint32_t app_node_tcp_start_stagger_ms(void);
+static uint32_t app_node_state_upload_stagger_ms(void);
 static uint32_t app_upload_schedule_jitter_ms(uint32_t nowTick);
 
 static uint16_t app_read_le16(const uint8_t* data)
@@ -500,18 +504,20 @@ static uint8_t app_current_relay_flags(void)
 /* Debounce-triggered state upload scheduler to collapse bursty local state changes. */
 static void app_schedule_state_upload(uint32_t nowTick, const char* reason)
 {
+    uint32_t settleMs = APP_STATE_UPLOAD_DEBOUNCE_MS + app_node_state_upload_stagger_ms();
+
     s_stateUploadPending = 1U;
-    s_stateUploadReadyTick = nowTick + APP_STATE_UPLOAD_DEBOUNCE_MS;
+    s_stateUploadReadyTick = nowTick + settleMs;
     s_stateUploadGeneration++;
     if (s_stateUploadGeneration == 0U)
     {
         s_stateUploadGeneration = 1U;
     }
 
-    app_debug_log("[NET] state upload pending reason=%s flags=0x%02X settle=%ums",
+    app_debug_log("[NET] state upload pending reason=%s flags=0x%02X settle=%lums",
                   (reason != 0) ? reason : "state",
                   (unsigned int)app_current_relay_flags(),
-                  (unsigned int)APP_STATE_UPLOAD_DEBOUNCE_MS);
+                  (unsigned long)settleMs);
 }
 
 static uint8_t app_fan_mode_to_duty(uint8_t fan)
@@ -615,80 +621,18 @@ static void app_refresh_fan_runtime(APP_NodeContext* node)
     }
 }
 
-/* Build and stage one ACK/ERR protocol reply for prioritized transmission. */
-static void app_queue_protocol_reply(uint8_t command,
-                                     uint16_t sequence,
-                                     const uint8_t* payload,
-                                     uint16_t payloadLength,
-                                     APP_SendKind kind)
-{
-    uint16_t frameLength;
-
-    frameLength = APP_HomeProtocol_BuildFrame(APP_NODE_ID,
-                                              command,
-                                              sequence,
-                                              payload,
-                                              payloadLength,
-                                              s_pendingReplyFrame,
-                                              (uint16_t)sizeof(s_pendingReplyFrame));
-    if (frameLength == 0U)
-    {
-        app_debug_log("[PROTO] reply build failed cmd=0x%02X", (unsigned int)command);
-        return;
-    }
-
-    s_pendingReplyLength = frameLength;
-    s_pendingReplyKind = kind;
-}
-
 /* Queue ACK reply for a successfully processed inbound command frame. */
 static void app_queue_protocol_ack(const APP_HomeProtocolFrame_t* frame)
 {
-    uint8_t payload[APP_HOME_ACK_PAYLOAD_LEN];
-
-    if (frame == 0)
-    {
-        return;
-    }
-
-    payload[0] = frame->command;
-    app_queue_protocol_reply(APP_HOME_CMD_ACK,
-                             frame->sequence,
-                             payload,
-                             (uint16_t)sizeof(payload),
-                             APP_SEND_KIND_ACK);
-#if APP_NODE_LOG_VERBOSE_PROTO
-    app_debug_log("[PROTO] ack queued seq=%u cmd=%s",
-                  (unsigned int)frame->sequence,
-                  APP_HomeProtocol_CommandToString(frame->command));
-#endif
+    (void)frame;
 }
 
 /* Queue ERR reply when inbound command validation or execution fails. */
 static void app_queue_protocol_error(const APP_HomeProtocolFrame_t* frame,
                                      APP_HomeProtocolError_t error)
 {
-    uint8_t payload[APP_HOME_ERR_PAYLOAD_LEN];
-    uint16_t sequence = 0U;
-    uint8_t command = 0U;
-
-    if (frame != 0)
-    {
-        sequence = frame->sequence;
-        command = frame->command;
-    }
-
-    payload[0] = command;
-    payload[1] = (uint8_t)error;
-    app_queue_protocol_reply(APP_HOME_CMD_ERR,
-                             sequence,
-                             payload,
-                             (uint16_t)sizeof(payload),
-                             APP_SEND_KIND_ERR);
-    app_debug_log("[PROTO] err queued seq=%u cmd=0x%02X err=%u",
-                  (unsigned int)sequence,
-                  (unsigned int)command,
-                  (unsigned int)error);
+    (void)frame;
+    (void)error;
 }
 
 /* Apply validated CONTROL frame to local state, outputs, and follow-up upload scheduling. */
@@ -756,7 +700,7 @@ static void app_handle_protocol_frame(APP_NodeContext* node, const APP_HomeProto
     /*
      * Command gate for frames addressed to this node.
      * ACK/ERR are terminal notifications (no reply). CONTROL triggers state
-     * changes and then returns ACK/ERR according to validation result.
+     * changes and the result is reflected by next telemetry/state upload.
      */
     APP_HomeProtocolError_t error = APP_HOME_ERR_NONE;
 
@@ -1454,36 +1398,6 @@ static uint8_t app_esp_send_ok_likely(const char* response)
     return 0U;
 }
 
-/* Detect likely successful CIPSTART even when response is incomplete/noisy. */
-static uint8_t app_esp_cipstart_likely_connected(const char* response)
-{
-    if ((response == 0) || (response[0] == '\0'))
-    {
-        return 0U;
-    }
-
-    if (app_esp_response_has_error(response) != 0U)
-    {
-        return 0U;
-    }
-
-    if ((strstr(response, "ALREADY CONNECTED") != 0) ||
-        (strstr(response, "ALREADY") != 0) ||
-        (strstr(response, "AREADY") != 0) ||
-        (strstr(response, "ALRADY") != 0) ||
-        (strstr(response, "ALEADY") != 0) ||
-        (strstr(response, "CONNECT") != 0) ||
-        (strstr(response, "CNNECT") != 0) ||
-        (strstr(response, "CONEC") != 0) ||
-        (strstr(response, "ONNCT") != 0) ||
-        (strstr(response, "CON") != 0))
-    {
-        return 1U;
-    }
-
-    return 0U;
-}
-
 /* Parse CIPSTATUS text for state indicating active TCP connection. */
 static uint8_t app_esp_cipstatus_likely_tcp_connected(const char* response)
 {
@@ -1616,6 +1530,20 @@ static void app_schedule_cipstart_retry(APP_NodeContext* node, uint32_t nowTick)
     s_tcpReopenNotBeforeTick = nowTick + APP_ESP_TCP_REOPEN_SETTLE_MS;
     s_espState = APP_ESP_STATE_UPLOAD_RECOVER_CLOSE;
     app_esp_exchange_reset();
+}
+
+static uint32_t app_node_tcp_start_stagger_ms(void)
+{
+    uint32_t nodeOrdinal = (APP_NODE_ID > 0U) ? ((uint32_t)APP_NODE_ID - 1U) : 0U;
+
+    return nodeOrdinal * APP_ESP_POST_IP_NODE_STAGGER_MS;
+}
+
+static uint32_t app_node_state_upload_stagger_ms(void)
+{
+    uint32_t nodeOrdinal = (APP_NODE_ID > 0U) ? ((uint32_t)APP_NODE_ID - 1U) : 0U;
+
+    return nodeOrdinal * APP_STATE_UPLOAD_NODE_STAGGER_MS;
 }
 
 /* Compute deterministic jitter to de-phase multiple node upload attempts. */
@@ -1943,6 +1871,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
      */
     APP_EspExchangeResult exchangeResult;
     HAL_StatusTypeDef status;
+    uint32_t tcpSettleMs;
     int payloadLength;
     char command[96];
 
@@ -2244,9 +2173,10 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                 s_tcpConnected = 0U;
                 s_cipstartFailCount = 0U;
                 s_cifsrRetryCount = 0U;
-                s_nextUploadAttemptTick = nowTick + APP_ESP_POST_IP_UPLOAD_DELAY_MS;
-                app_debug_log("[NET] wifi ip confirmed, wait TCP stack settle %ums",
-                              (unsigned int)APP_ESP_POST_IP_UPLOAD_DELAY_MS);
+                tcpSettleMs = APP_ESP_POST_IP_UPLOAD_DELAY_MS + app_node_tcp_start_stagger_ms();
+                s_nextUploadAttemptTick = nowTick + tcpSettleMs;
+                app_debug_log("[NET] wifi ip confirmed, wait TCP stack settle %lums",
+                              (unsigned long)tcpSettleMs);
                 s_espState = APP_ESP_STATE_WIFI_CMD_CIPSTATUS;
             }
             else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
@@ -2432,7 +2362,7 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
             break;
 
         case APP_ESP_STATE_UPLOAD_CMD_CIPSTART:
-            /* Open TCP only when needed; probe CIPSEND if the AT response is ambiguous. */
+            /* Open TCP only after a definite ESP success response. */
             (void)snprintf(command,
                            sizeof(command),
                            "AT+CIPSTART=\"TCP\",\"%s\",%lu\r\n",
@@ -2446,44 +2376,20 @@ static void app_service_esp(APP_NodeContext* node, uint32_t nowTick)
                                                    "ALREADY CONNECTED",
                                                    APP_ESP_TCP_TIMEOUT_MS,
                                                    1U);
-            if ((exchangeResult == APP_ESP_EXCHANGE_OK) ||
-                ((exchangeResult == APP_ESP_EXCHANGE_FAIL) &&
-                 (app_esp_cipstart_likely_connected(s_espExchange.response) != 0U)))
+            if (exchangeResult == APP_ESP_EXCHANGE_OK)
             {
                 s_tcpConnected = 1U;
                 s_cipstartFailCount = 0U;
-                if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
-                {
-                    app_debug_log("[NET] CIPSTART uncertain, continue CIPSEND");
-                }
                 s_espState = APP_ESP_STATE_UPLOAD_CMD_CIPSEND;
             }
             else if (exchangeResult == APP_ESP_EXCHANGE_FAIL)
             {
                 if (app_esp_response_has_error(s_espExchange.response) == 0U)
                 {
-                    app_debug_log("[NET] CIPSTART no final OK, wait then probe CIPSEND");
-                    s_tcpConnected = 1U;
-                    s_espStateDeadlineTick = nowTick + APP_ESP_CIPSTART_PROBE_DELAY_MS;
-                    s_espState = APP_ESP_STATE_UPLOAD_CIPSTART_SETTLE;
-                    app_esp_exchange_reset();
+                    app_debug_log("[NET] CIPSTART no final OK, close and retry later");
                 }
-                else
-                {
-                    app_schedule_cipstart_retry(node, nowTick);
-                }
+                app_schedule_cipstart_retry(node, nowTick);
             }
-            break;
-
-        case APP_ESP_STATE_UPLOAD_CIPSTART_SETTLE:
-            (void)app_esp_collect_response_slice(node, 0);
-            if (app_tick_reached(nowTick, s_espStateDeadlineTick) == 0U)
-            {
-                break;
-            }
-
-            s_espState = APP_ESP_STATE_UPLOAD_CMD_CIPSEND;
-            app_esp_exchange_reset();
             break;
 
         case APP_ESP_STATE_UPLOAD_CMD_CIPSEND:
@@ -3101,7 +3007,7 @@ HAL_StatusTypeDef APP_Node_Init(APP_NodeContext* node)
     s_lastDhtPollTick = nowTick;
     s_lastWifiAttemptTick = nowTick - APP_WIFI_RETRY_MS;
     node->lastTelemetryTick = nowTick - APP_UPLOAD_INTERVAL_MS;
-    s_nextUploadAttemptTick = nowTick + ((uint32_t)(APP_NODE_ID - 1U) * 600U);
+    s_nextUploadAttemptTick = nowTick + app_node_tcp_start_stagger_ms();
     app_debug_log("[NET] cfg ssid=\"%s\" passLen=%u host=\"%s\" port=%lu",
                   APP_WIFI_SSID,
                   (unsigned int)strlen(APP_WIFI_PASSWORD),
